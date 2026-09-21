@@ -1,0 +1,8 @@
+{
+  "norm_files": {
+    "norm/libraries/openai/module.norm": "64411e1cff5b8f6fa4392f577df72fde7896136a33daa33f1396b6df7bbf009d",
+    "norm/libraries/openai/client.norm": "2ec7e6d9e056e5bfa6fee58cc4e2ead652fc16aadf536c95dddde02b205fe2e8",
+    "cli/compiler/stdlib-abi.json": "882f68808682147f29771c5f93425b2995e0daec8271e67c0ff1086aebe000b7"
+  },
+  "hash": "sha256-utf8-lf"
+}

@@ -1,0 +1,7 @@
+.tmp/
+dependencies/
+gait/build/
+dist/
+__pycache__/
+*.pyc
+.env
