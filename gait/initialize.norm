@@ -1,0 +1,29 @@
+package gait
+
+import std.io.printError
+
+public Report initialize() {
+  UserConfig previous = loadConfiguration()
+  String key = promptConfiguration(label: "API 密钥", fallback: previous.effective.apiKey, secret: true)
+  String model = promptConfiguration(label: "模型名称", fallback: previous.effective.model)
+  String endpoint = promptConfiguration(label: "接口地址", fallback: previous.effective.endpoint)
+  printError(text: "正在测试连接……\n")
+  return configure(candidate: AiConfig(apiKey: key, model: model, endpoint: endpoint), previous: previous)
+}
+
+private String promptConfiguration(String label, String? fallback, Boolean secret = false) {
+  String prompt = label
+  if fallback != null {
+    prompt = prompt + " [" + if secret { "******" } else { fallback } + "]"
+  }
+  String answer = ""
+  for answer.isEmpty() {
+    printError(text: prompt + ": ")
+    String? line = readConsoleLine(maximumBytes: 4096)
+    if line == null { throw Problem(code: "CONFIG_CANCELLED", message: "输入已结束，未保存配置。") }
+    answer = line.trim()
+    if answer.isEmpty() && fallback != null { answer = fallback }
+    if answer.isEmpty() { printError(text: "此项不能为空，请重新输入。\n") }
+  }
+  return answer
+}

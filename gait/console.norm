@@ -1,0 +1,34 @@
+package gait
+
+import std.io.standardInput
+import std.io.ReadChunk
+import std.io.Bytes
+import std.io.bytes
+import std.io.decodeText
+import std.io.TextEncoding
+
+public String? readConsoleLine(Integer maximumBytes) {
+  Array<Integer> content = Array.filled(size: maximumBytes, value: 0)
+  Integer length = 0
+  Boolean finished = false
+  var input = standardInput()
+  for !finished {
+    switch input.read(maximumBytes: 1) {
+      case Data(Bytes part) {
+        Integer value = part.at(index: 0)
+        if value == 10 { finished = true }
+        else {
+          if length == maximumBytes { throw Problem(code: "INVALID_ARGUMENT", message: "输入超过字节预算。") }
+          content[length] = value
+          length = length + 1
+        }
+      }
+      case Eof {
+        if length == 0 { return null }
+        finished = true
+      }
+    }
+  }
+  if length > 0 && content[length - 1] == 13 { length = length - 1 }
+  return decodeText(content: bytes(values: content).slice(start: 0, length: length), encoding: TextEncoding.Utf8)
+}

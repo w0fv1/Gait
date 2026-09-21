@@ -1,0 +1,3 @@
+Module module() {
+  return module(name: "gait", version: 1, dependencies: [dependency(repository: "github", name: "openai", version: 1)])
+}

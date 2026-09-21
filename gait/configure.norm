@@ -1,0 +1,70 @@
+package gait
+
+import std.core.Exception
+import std.application.environmentVariable
+import std.serialization.Serializable
+import std.filesystem.Path
+import std.filesystem.writeTextAtomic
+import std.io.TextEncoding
+import std.json.parseJson
+import std.json.writeJson
+import std.http.Uri
+import openai.Client
+import openai.ResponseInput
+import openai.ResponseRequest
+import openai.StructuredOutput
+import openai.StructuredOutputMode
+import openai.OpenAiException
+
+@Serializable()
+private value ConnectionProbe { Boolean ok }
+
+public Report configure(AiConfig candidate, UserConfig previous) {
+  String? key = candidate.apiKey
+  String? model = candidate.model
+  if key == null || key.isBlank || model == null || model.isBlank || candidate.endpoint.isBlank {
+    throw Problem(code: "CONFIG_ERROR", message: "需要完整的密钥、模型名称和接口地址。")
+  }
+  String endpoint = responsesEndpoint(address: candidate.endpoint)
+  try {
+    Client client = Client(apiKey: key, endpoint: Uri(value: endpoint))
+    var response = client.create(request: ResponseRequest(model: model, input: ResponseInput.Text(value: "Verify that this connection supports structured responses. Return ok true."),
+      format: StructuredOutput(mode: StructuredOutputMode.JsonObject, name: "connection_probe", schema: parseJson(value: "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"],\"additionalProperties\":false}"))))
+    ConnectionProbe probe = response.decode<ConnectionProbe>()
+    if !probe.ok { throw Problem(code: "CONFIG_TEST_FAILED", message: "模型未通过连接测试。") }
+  } catch OpenAiException error {
+    Integer? status = error.httpStatus
+    String label = if status != null { "HTTP " + status.toString() } else { "模型响应错误" }
+    String detail = error.message.replace(target: key, replacement: "[已隐藏]")
+    throw Problem(code: "CONFIG_TEST_FAILED", message: label + "：" + detail + "；原配置未修改。")
+  } catch Exception error {
+    throw Problem(code: "CONFIG_TEST_FAILED", message: "候选配置未通过真实连接和结构化响应测试，原配置未修改。")
+  }
+  if readConfigSource(path: previous.path) != previous.original {
+    throw Problem(code: "CONFIG_CHANGED", message: "配置文件在处理期间被修改，未覆盖其他修改，请重试。")
+  }
+  Facts stored = Facts()
+  stored.text(key: "apiKey", value: key)
+  stored.text(key: "model", value: model)
+  stored.text(key: "endpoint", value: endpoint)
+  String content = writeJson(value: stored.json()) + "\n"
+  try { writeTextAtomic(path: Path(value: previous.path), text: content, encoding: TextEncoding.Utf8) }
+  catch Exception error { throw Problem(code: "CONFIG_SAVE_FAILED", message: "连接测试成功，但无法原子保存配置文件。") }
+  Facts data = Facts()
+  data.text(key: "config_path", value: previous.path)
+  data.text(key: "model", value: model)
+  data.text(key: "endpoint", value: endpoint)
+  data.boolean(key: "connection_tested", value: true)
+  data.boolean(key: "config_saved", value: true)
+  List<String> overridden = []
+  String? envKey = environmentVariable(name: "GAIT_AI_API_KEY")
+  String? envModel = environmentVariable(name: "GAIT_AI_MODEL")
+  String? envEndpoint = environmentVariable(name: "GAIT_AI_ENDPOINT")
+  if envKey != null && envKey != key { overridden.add("GAIT_AI_API_KEY") }
+  if envModel != null && envModel != model { overridden.add("GAIT_AI_MODEL") }
+  if envEndpoint != null && responsesEndpoint(address: envEndpoint) != endpoint { overridden.add("GAIT_AI_ENDPOINT") }
+  data.strings(key: "overriding_environment", value: overridden)
+  List<Problem> issues = []
+  if overridden.size() > 0 { issues.add(Problem(code: "CONFIG_OVERRIDDEN", message: "配置已保存；当前会话中不同值的环境变量仍优先，请清除对应变量后使用新配置。")) }
+  return Report(status: "ok", changed: false, data: data, issues: issues, description: "模型连接测试成功，已保存用户配置。", exitCode: 0)
+}

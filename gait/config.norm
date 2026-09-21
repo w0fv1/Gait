@@ -1,0 +1,92 @@
+package gait
+
+import std.application.environmentVariable
+import std.filesystem.Path
+import std.filesystem.readText
+import std.filesystem.FileException
+import std.filesystem.FileFailure
+import std.io.TextEncoding
+import std.io.IOException
+import std.io.TextException
+import std.json.parseJson
+import std.json.JsonValue
+import std.json.JsonException
+
+public value AiConfig {
+  String? apiKey
+  String? model
+  String endpoint
+}
+
+public value UserConfig {
+  AiConfig effective
+  String path
+  String? original
+}
+
+public String responsesEndpoint(String address) {
+  String endpoint = address.trim()
+  if endpoint.endsWith(suffix: "/") { endpoint = endpoint.sliceCodePoints(start: 0, end: endpoint.codePointSize() - 1) }
+  if endpoint.endsWith(suffix: "/v1") { endpoint = endpoint + "/responses" }
+  return endpoint
+}
+
+public String? readConfigSource(String path) {
+  try { return readText(path: Path(value: path), encoding: TextEncoding.Utf8, maximumBytes: 65536) }
+  catch FileException error {
+    if error.reason == FileFailure.NotFound { return null }
+    throw Problem(code: "CONFIG_ERROR", message: "无法读取配置文件。")
+  }
+  catch TextException error { throw Problem(code: "CONFIG_ERROR", message: "配置必须使用 UTF-8 编码。") }
+  catch IOException error { throw Problem(code: "CONFIG_ERROR", message: "无法完整读取配置文件。") }
+}
+
+public UserConfig loadConfiguration() {
+  String? directory = environmentVariable(name: "APPDATA")
+  if directory == null {
+    String? profile = environmentVariable(name: "USERPROFILE")
+    if profile != null { directory = profile + "/AppData/Roaming" }
+    else {
+      directory = environmentVariable(name: "XDG_CONFIG_HOME")
+      if directory == null {
+        String? home = environmentVariable(name: "HOME")
+        if home != null { directory = home + "/.config" }
+      }
+    }
+  }
+  if directory == null || directory.isBlank { throw Problem(code: "CONFIG_ERROR", message: "无法定位用户配置目录。") }
+  String path = directory + "/gait/config.json"
+  String? original = readConfigSource(path: path)
+  Map<String, String> settings = Map<>()
+  if original != null {
+    try {
+      String source = original
+      switch parseJson(value: source) {
+        case Object(Map<String, JsonValue> fields) {
+          for Pair<String, JsonValue> entry : fields {
+            if entry.first != "apiKey" && entry.first != "model" && entry.first != "endpoint" {
+              throw Problem(code: "CONFIG_ERROR", message: "配置包含未知字段：" + path)
+            }
+            switch entry.second {
+              case String(String value) {
+                if value.isBlank { throw Problem(code: "CONFIG_ERROR", message: "配置字段不能是空字符串：" + path) }
+                settings.put(key: entry.first, value: value)
+              }
+              case _ { throw Problem(code: "CONFIG_ERROR", message: "配置字段必须是字符串：" + path) }
+            }
+          }
+        }
+        case _ { throw Problem(code: "CONFIG_ERROR", message: "配置必须是 JSON 对象：" + path) }
+      }
+    } catch JsonException error { throw Problem(code: "CONFIG_ERROR", message: "配置不是有效的 JSON：" + path) }
+  }
+  String? key = environmentVariable(name: "GAIT_AI_API_KEY")
+  if key == null { key = settings.get(key: "apiKey") }
+  String? model = environmentVariable(name: "GAIT_AI_MODEL")
+  if model == null { model = settings.get(key: "model") }
+  String endpoint = environmentVariable(name: "GAIT_AI_ENDPOINT") ?? settings.get(key: "endpoint") ?? "https://api.openai.com/v1/responses"
+  if ((key != null && key.isBlank) || (model != null && model.isBlank) || endpoint.isBlank) {
+    throw Problem(code: "CONFIG_ERROR", message: "模型配置不能是空字符串。")
+  }
+  return UserConfig(effective: AiConfig(apiKey: key, model: model, endpoint: responsesEndpoint(address: endpoint)), path: path, original: original)
+}

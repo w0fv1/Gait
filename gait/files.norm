@@ -1,0 +1,66 @@
+package gait
+
+public value RepositoryFile {
+  String path
+  String hash
+  String diff
+
+  public Facts page(Integer startLine, Integer lineCount, Integer budget) {
+    String page = ""
+    Integer total = 0
+    Integer end = startLine - 1
+    Integer remaining = budget
+    Boolean body = false
+    Boolean clipped = false
+    for String line : diff.split(separator: "\n") {
+      if line.startsWith(prefix: "@@") { body = true }
+      else if body && line.startsWith(prefix: "+") {
+        total = total + 1
+        if total >= startLine && total < startLine + lineCount && remaining > 0 {
+          Integer count = line.codePointSize()
+          if count > remaining { count = remaining clipped = true }
+          page = page + line.sliceCodePoints(start: 0, end: count) + "\n"
+          remaining = remaining - count - 1
+          end = total
+        }
+      }
+    }
+    if !body { page = diff }
+    Integer next = if end < total { end + 1 } else { 0 }
+    Facts file = Facts()
+    file.text(key: "path", value: path)
+    file.text(key: "hash", value: hash)
+    file.text(key: "diff", value: page)
+    file.number(key: "start_line", value: startLine)
+    file.number(key: "end_line", value: if end >= startLine { end } else { 0 })
+    file.number(key: "total_lines", value: total)
+    file.number(key: "next_line", value: next)
+    file.boolean(key: "line_truncated", value: clipped)
+    file.boolean(key: "truncated", value: next != 0 || clipped)
+    return file
+  }
+}
+
+public Void validateRepositoryPaths(List<String> paths) {
+  for String path : paths {
+    String normalized = path.replace(target: "\\", replacement: "/")
+    if path.isBlank || normalized.startsWith(prefix: "/") || normalized.contains(value: ":") || normalized.contains(value: nulSeparator()) {
+      throw Problem(code: "INVALID_ARGUMENT", message: "路径必须是仓库根目录内的相对路径。")
+    }
+    for String part : normalized.split(separator: "/") {
+      if part == ".." || part.equalsIgnoreCaseAscii(other: ".git") { throw Problem(code: "INVALID_ARGUMENT", message: "路径不能越出仓库或操作 Git 元数据。") }
+    }
+  }
+}
+
+public RepositoryFile readRepositoryFile(Git git, String path) {
+  validateRepositoryPaths(paths: [path])
+  String listed = git.require(arguments: ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", path])
+  if listed != path.replace(target: "\\", replacement: "/") + nulSeparator() { throw Problem(code: "INVALID_PATH", message: "需要指定已跟踪或未被忽略的单个文件：" + path) }
+  String hash = git.require(arguments: ["hash-object", "--no-filters", "--", path]).trim()
+  GitReply reply = git.run(arguments: ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--", "/dev/null", path])
+  if reply.code != 0 && reply.code != 1 { throw Problem(code: "GIT_ERROR", message: reply.error.trim()) }
+  if reply.truncated { throw Problem(code: "OUTPUT_TRUNCATED", message: "文件超过 4 MB 读取上限：" + path) }
+  if git.require(arguments: ["hash-object", "--no-filters", "--", path]).trim() != hash { throw Problem(code: "STATE_CHANGED", message: "读取期间文件发生变化：" + path) }
+  return RepositoryFile(path: path, hash: hash, diff: reply.output)
+}

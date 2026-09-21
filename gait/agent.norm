@@ -1,0 +1,94 @@
+package gait
+
+import std.json.JsonValue
+import std.json.writeJson
+import std.http.Uri
+import std.io.printError
+import std.io.print
+import openai.Client
+import openai.ResponseRequest
+import openai.ResponseInput
+import openai.ResponseStatus
+import openai.FunctionCall
+
+private class StreamOutput {
+  public Boolean written = false
+
+  public Void accept(String delta) {
+    if !delta.isEmpty() { print(text: delta) written = true }
+  }
+}
+
+public Void runAgent(String input, String directory, Boolean json) {
+  AgentTools tools = AgentTools(directory: directory)
+  Facts user = Facts()
+  user.text(key: "role", value: "user")
+  user.text(key: "content", value: input)
+  List<JsonValue> history = [user.json()]
+  List<JsonValue> results = []
+  List<JsonValue> effects = []
+  Boolean finished = false
+  Integer rounds = 0
+  for !finished && rounds < 64 {
+    rounds = rounds + 1
+    AiConfig config = loadConfiguration().effective
+    String? key = config.apiKey
+    String? model = config.model
+    if key == null || model == null { throw Problem(code: "CONFIG_REQUIRED", message: "请先运行 --init 配置模型连接。") }
+    Client client = Client(apiKey: key, endpoint: Uri(value: config.endpoint))
+    if writeJson(value: JsonValue.Array(values: history)).codePointSize() > 60000 {
+      printError(text: "正在整理本次任务上下文，保留目标和已执行操作……\n")
+      history = compactContext(client: client, model: model, goal: input, history: history, effects: effects)
+    }
+    StreamOutput output = StreamOutput()
+    var response = client.create(request: ResponseRequest(model: model, input: ResponseInput.Items(values: history), tools: tools.definitions(), maximumOutputTokens: 8192,
+        instructions: agentInstructions(model: model, endpoint: config.endpoint)), onText: (String delta) {
+        if !json { output.accept(delta: delta) }
+      })
+    if output.written { print(text: "\n") }
+    if response.status != ResponseStatus.Completed {
+      throw Problem(code: "AI_INCOMPLETE", message: "模型响应未完成，未执行该响应中的工具。")
+    }
+    Map<String, Boolean> identifiers = Map<>()
+    for FunctionCall call : response.calls {
+      if call.callId.isBlank || identifiers.containsKey(key: call.callId) { throw Problem(code: "AI_ERROR", message: "模型返回重复或空的工具调用标识。") }
+      identifiers.put(key: call.callId, value: true)
+    }
+    for JsonValue item : response.output { history.add(item) }
+    for FunctionCall call : response.calls {
+      String details = if call.name == "git_read_files" || call.name == "git_summarize_file" { " " + call.arguments } else { "" }
+      printError(text: "工具：" + call.name + details + "\n")
+      Report result = tools.invoke(call: call, userMessages: input)
+      String output = result.render(json: true)
+      Facts value = Facts()
+      value.text(key: "type", value: "function_call_output")
+      value.text(key: "call_id", value: call.callId)
+      value.text(key: "output", value: output)
+      history.add(value.json())
+      Facts record = Facts()
+      record.text(key: "name", value: call.name)
+      record.text(key: "call_id", value: call.callId)
+      record.text(key: "output", value: output)
+      results.add(record.json())
+      if call.name != "git_status" && call.name != "git_diff" && call.name != "git_read_files" && call.name != "git_summarize_file" {
+        record.text(key: "arguments", value: call.arguments)
+        effects.add(record.json())
+      }
+    }
+    finished = response.calls.size() == 0
+    if finished {
+      String answer = response.text
+      String? refusal = response.refusal
+      if refusal != null && !refusal.isEmpty() { answer = answer + if answer.isEmpty() { "" } else { "\n" } + refusal }
+      if answer.isEmpty() { throw Problem(code: "AI_ERROR", message: "模型没有返回回复或工具调用。") }
+      if json {
+        Facts value = Facts()
+        value.text(key: "type", value: "assistant")
+        value.text(key: "text", value: answer)
+        value.values.put(key: "tools", value: JsonValue.Array(values: results))
+        printLine(writeJson(value: value.json()))
+      }
+    }
+  }
+  if !finished { throw Problem(code: "TOOL_LIMIT", message: "本次请求达到 64 次模型调用上限，已停止继续执行。") }
+}

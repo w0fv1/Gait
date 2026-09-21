@@ -1,0 +1,174 @@
+package gait
+
+import std.core.Exception
+import std.json.JsonValue
+
+public Report execute(Git git, Action action, Observation initial) {
+  Boolean branchAction = action.kind == ActionKind.CreateBranch || action.kind == ActionKind.CreateAndSwitch || action.kind == ActionKind.SwitchBranch
+  Boolean pathAction = action.kind == ActionKind.Stage || action.kind == ActionKind.Diff || action.kind == ActionKind.ReadFiles
+  if branchAction {
+    if action.branch.isBlank { throw Problem(code: "MISSING_ARGUMENT", message: "需要提供分支名称。") }
+    if action.branch.startsWith(prefix: "-") || action.branch.contains(value: "@{") || git.run(arguments: ["check-ref-format", "--branch", action.branch]).code != 0 {
+      throw Problem(code: "INVALID_ARGUMENT", message: "分支名称无效。")
+    }
+  } else if !action.branch.isEmpty() { throw Problem(code: "AMBIGUOUS_INTENT", message: "动作包含无关的分支参数。") }
+  if !pathAction && action.paths.size() != 0 { throw Problem(code: "AMBIGUOUS_INTENT", message: "动作包含无关的路径参数。") }
+  if action.kind != ActionKind.Commit && !action.message.isEmpty() { throw Problem(code: "AMBIGUOUS_INTENT", message: "动作包含无关的提交消息。") }
+  if action.kind != ActionKind.Diff && action.staged { throw Problem(code: "AMBIGUOUS_INTENT", message: "动作包含无关的差异范围。") }
+  validateRepositoryPaths(paths: action.paths)
+  if action.kind == ActionKind.Status {
+    return Report(status: "ok", changed: false, data: initial.facts(), issues: [], description: "已读取当前仓库状态。", exitCode: 0)
+  }
+  if action.kind == ActionKind.Diff {
+    List<String> args = ["diff", "--no-ext-diff", "--no-textconv"]
+    if action.staged { args.add("--cached") }
+    args.add("--")
+    for String path : action.paths { args.add(path) }
+    GitReply reply = git.run(arguments: args, budget: 65536)
+    if reply.code != 0 { return rejected(problem: Problem(code: "GIT_ERROR", message: reply.error.trim()), exitCode: 1) }
+    Facts data = Facts()
+    data.text(key: "diff", value: reply.output)
+    data.text(key: "scope", value: if action.staged { "staged" } else { "unstaged" })
+    data.strings(key: "paths", value: action.paths)
+    List<Problem> issues = []
+    if reply.truncated { issues.add(Problem(code: "OUTPUT_TRUNCATED", message: "差异超过输出预算，请在下一次调用中指定更小的路径范围。")) }
+    return Report(status: "ok", changed: false, data: data, issues: issues, description: "已读取指定范围的差异。", exitCode: 0)
+  }
+  if action.kind == ActionKind.ReadFiles {
+    if action.paths.size() == 0 || action.paths.size() > 8 { throw Problem(code: "INVALID_ARGUMENT", message: "每次需要指定 1 到 8 个文件路径。") }
+    if action.startLine < 1 || action.lineCount < 1 || action.lineCount > 200 { throw Problem(code: "INVALID_ARGUMENT", message: "startLine 必须为正数，lineCount 必须为 1 到 200。") }
+    List<JsonValue> files = []
+    List<Problem> issues = []
+    for String path : action.paths {
+      RepositoryFile source = readRepositoryFile(git: git, path: path)
+      Facts file = source.page(startLine: action.startLine, lineCount: action.lineCount, budget: 32768 / action.paths.size())
+      files.add(file.json())
+    }
+    Facts data = Facts()
+    data.values.put(key: "files", value: JsonValue.Array(values: files))
+    return Report(status: "ok", changed: false, data: data, issues: issues, description: "已读取指定文件内容。", exitCode: 0)
+  }
+  for Change change : initial.changes() {
+    if change.conflicted() { throw Problem(code: "CONFLICT", message: "仓库存在未解决的冲突。") }
+  }
+  if initial.operations.size() != 0 {
+    throw Problem(code: "OPERATION_IN_PROGRESS", message: "仓库有进行中的操作或冲突，请先明确处理该状态。")
+  }
+  String targetHead = ""
+  if branchAction {
+    String existing = git.resolveRef(name: "refs/heads/" + action.branch)
+    targetHead = existing
+    if action.kind == ActionKind.SwitchBranch && existing.isEmpty() { throw Problem(code: "BRANCH_NOT_FOUND", message: "指定的本地分支不存在。") }
+    if action.kind != ActionKind.SwitchBranch && !existing.isEmpty() { throw Problem(code: "BRANCH_EXISTS", message: "同名分支已存在，不会覆盖。") }
+    if action.kind != ActionKind.SwitchBranch && initial.head.isEmpty() { throw Problem(code: "MISSING_HEAD", message: "当前仓库尚无提交，无法从 HEAD 创建分支。") }
+  }
+  if action.kind == ActionKind.SwitchBranch && !initial.head.isEmpty() {
+    var changedPaths = git.require(arguments: ["diff", "--name-only", "-z", "--no-renames", initial.head, targetHead, "--"]).split(separator: nulSeparator())
+    for Change local : initial.changes() {
+      for String path : changedPaths {
+        if local.path == path { throw Problem(code: "CONFLICT", message: "切换目标会涉及本地未提交的路径：" + path) }
+      }
+    }
+  }
+  if action.kind == ActionKind.Stage {
+    if action.paths.size() == 0 { throw Problem(code: "MISSING_ARGUMENT", message: "需要提供明确路径。") }
+    List<String> check = ["add", "--dry-run", "--"]
+    for String path : action.paths { check.add(path) }
+    GitReply preview = git.run(arguments: check)
+    if preview.truncated { throw Problem(code: "OUTPUT_TRUNCATED", message: "暂存范围超过核对预算。") }
+    if preview.code != 0 { throw Problem(code: "INVALID_PATH", message: preview.error.trim()) }
+  }
+  if action.kind == ActionKind.Commit {
+    if action.message.isBlank { throw Problem(code: "MISSING_ARGUMENT", message: "需要提供提交消息。") }
+    GitReply staged = git.run(arguments: ["diff", "--cached", "--quiet", "--exit-code"])
+    if staged.code == 0 { throw Problem(code: "NOTHING_STAGED", message: "暂存区没有可提交的改动。") }
+    if staged.code != 1 { throw Problem(code: "GIT_ERROR", message: "无法检查暂存区。") }
+  }
+  Observation before = git.observe(detailed: true)
+  if initial.detailed && before != initial { throw Problem(code: "STATE_CHANGED", message: "模型理解期间仓库内容已变化，未执行写操作。") }
+  if before.head != initial.head || before.branch != initial.branch || before.status != initial.status || before.operations != initial.operations {
+    throw Problem(code: "STATE_CHANGED", message: "理解意图期间仓库状态已变化，请使用完整意图重试。")
+  }
+  Observation ready = git.observe(detailed: true)
+  if before != ready { throw Problem(code: "STATE_CHANGED", message: "执行前仓库状态已变化，未执行写操作。") }
+  GitReply? reply = null
+  Problem? failure = null
+  Boolean created = false
+  try {
+    if action.kind == ActionKind.CreateBranch || action.kind == ActionKind.CreateAndSwitch {
+      reply = git.run(arguments: ["branch", "--", action.branch, before.head])
+      created = git.resolveRef(name: "refs/heads/" + action.branch) == before.head
+      if reply != null && reply.code == 0 && created && action.kind == ActionKind.CreateAndSwitch {
+        Observation between = git.observe(detailed: true)
+        if between.head != before.head || between.branch != before.branch || between.index != before.index || between.worktree != before.worktree || between.untracked != before.untracked {
+          throw Problem(code: "STATE_CHANGED", message: "分支已创建，但切换前工作区发生变化。")
+        }
+        reply = git.run(arguments: ["switch", "--no-guess", "--", action.branch])
+      }
+    } else if action.kind == ActionKind.SwitchBranch {
+      reply = git.run(arguments: ["switch", "--no-guess", "--", action.branch])
+    } else if action.kind == ActionKind.Stage {
+      List<String> args = ["add", "--"]
+      for String path : action.paths { args.add(path) }
+      reply = git.run(arguments: args)
+    } else if action.kind == ActionKind.Commit {
+      reply = git.run(arguments: ["-c", "i18n.commitEncoding=UTF-8", "commit", "--cleanup=verbatim", "--file=-"], input: action.message)
+    }
+  } catch Problem error { failure = error }
+  catch Exception error { failure = Problem(code: "GIT_ERROR", message: error.message) }
+  Observation after = before
+  try { after = git.observe(detailed: true) }
+  catch Exception error {
+    Facts data = Facts()
+    data.text(key: "repository", value: git.root)
+    return Report(status: "partial", changed: null, data: data,
+      issues: [Problem(code: "STATE_UNKNOWN", message: "已尝试执行，无法完整核实当前状态：" + error.message)], description: "执行效果尚未完全确认。", exitCode: 1)
+  }
+  Boolean changed = before != after
+  Facts data = after.facts()
+  Boolean verified = false
+  String description = "目标未完成，已重新读取当前仓库状态。"
+  try {
+    if action.kind == ActionKind.CreateBranch || action.kind == ActionKind.CreateAndSwitch {
+      created = git.resolveRef(name: "refs/heads/" + action.branch) == before.head
+      data.text(key: "created_branch", value: if created { action.branch } else { "" })
+      data.boolean(key: "switched", value: after.branch == action.branch)
+      verified = created && after.head == before.head && (if action.kind == ActionKind.CreateAndSwitch { after.branch == action.branch } else { after.branch == before.branch })
+      description = if verified { "分支已创建；当前分支为 " + after.branch + "。" } else { "分支操作未全部完成，请检查已创建分支和当前分支。" }
+    } else if action.kind == ActionKind.SwitchBranch {
+      verified = after.branch == action.branch && after.head == targetHead
+      data.boolean(key: "switched", value: verified)
+      description = "当前分支为 " + after.branch + "。"
+    } else if action.kind == ActionKind.Stage {
+      List<String> args = ["diff", "--quiet", "--exit-code", "--"]
+      for String path : action.paths { args.add(path) }
+      GitReply remaining = git.run(arguments: args)
+      List<String> untrackedArgs = ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+      for String path : action.paths { untrackedArgs.add(path) }
+      verified = remaining.code == 0 && git.require(arguments: untrackedArgs).isEmpty()
+      data.strings(key: "paths", value: action.paths)
+      description = if verified { "指定路径的当前改动已暂存。" } else { "指定路径未完全暂存。" }
+    } else if action.kind == ActionKind.Commit {
+      verified = after.head != before.head && !after.head.isEmpty() && after.index == before.index && git.run(arguments: ["diff", "--cached", "--quiet", "HEAD"]).code == 0
+      if verified {
+        String expectedMessage = action.message
+        verified = git.require(arguments: ["log", "-1", "--format=%B"]) == expectedMessage + "\n" && after.branch == before.branch
+      }
+      if verified && !before.head.isEmpty() { verified = git.resolveRef(name: "HEAD^1") == before.head }
+      data.text(key: "commit", value: if after.head != before.head { after.head } else { "" })
+      description = if verified { "已提交执行前的暂存区。" } else { "提交目标未完全验证。" }
+    }
+  } catch Exception error { failure = Problem(code: "STATE_UNKNOWN", message: error.message) }
+  List<Problem> issues = []
+  if failure != null { issues.add(failure) }
+  if reply != null {
+    if reply.code != 0 { issues.add(Problem(code: "GIT_ERROR", message: if reply.error.isBlank { "Git 操作失败，退出码 " + reply.code.toString() + "。" } else { reply.error.trim() })) }
+    if reply.truncated { issues.add(Problem(code: "OUTPUT_TRUNCATED", message: "Git 过程输出已截断，结果基于重新读取的仓库事实。")) }
+  }
+  if verified && failure == null {
+    return Report(status: "ok", changed: changed, data: data, issues: issues, description: description, exitCode: 0)
+  }
+  if issues.size() == 0 { issues.add(Problem(code: "STATE_CHANGED", message: "实际效果与请求不一致。")) }
+  return Report(status: if changed { "partial" } else { "failed" }, changed: changed, data: data,
+    issues: issues, description: description, exitCode: 1)
+}

@@ -1,0 +1,123 @@
+package gait
+
+import std.core.Exception
+import std.json.JsonValue
+import std.json.writeJson
+
+public class Problem extends Exception {
+  String code
+  Problem(String code, String message) {
+    super(message: message)
+    this.code = code
+  }
+}
+
+public class Facts {
+  Map<String, JsonValue> values = Map<>()
+
+  public Void text(String key, String value) { values.put(key: key, value: JsonValue.String(value: value)) }
+  public Void number(String key, Integer value) { values.put(key: key, value: JsonValue.Number(value: value.toString())) }
+  public Void boolean(String key, Boolean value) { values.put(key: key, value: JsonValue.Boolean(value: value)) }
+  public Void strings(String key, List<String> value) {
+    List<JsonValue> items = []
+    for String item : value { items.add(JsonValue.String(value: item)) }
+    values.put(key: key, value: JsonValue.Array(values: items))
+  }
+  public JsonValue json() { return JsonValue.Object(fields: values) }
+
+  public String render() {
+    String result = ""
+    for Pair<String, JsonValue> entry : values {
+      String label = switch entry.first {
+        case "branch" { break "当前分支" }
+        case "head" { break "当前提交" }
+        case "staged" { break "已暂存文件数" }
+        case "unstaged" { break "未暂存文件数" }
+        case "untracked" { break "未跟踪文件数" }
+        case "conflicts" { break "冲突文件数" }
+        case "operations" { break "进行中的操作" }
+        case "created_branch" { break "已创建分支" }
+        case "switched" { break "是否已切换到目标分支" }
+        case "paths" { break "路径" }
+        case "scope" { break "差异范围" }
+        case "diff" { break "差异" }
+        case "commit" { break "提交标识" }
+        case "repository" { break "仓库" }
+        case "usage" { break "用法" }
+        case "examples" { break "示例" }
+        case "config_path" { break "配置文件" }
+        case "model" { break "模型" }
+        case "endpoint" { break "接口地址" }
+        case "connection_tested" { break "连接测试通过" }
+        case "config_saved" { break "配置已保存" }
+        case "overriding_environment" { break "仍覆盖新配置的环境变量" }
+        case _ { break entry.first }
+      }
+      result = result + "\n" + label + "：" + readable(value: entry.second)
+    }
+    return result
+  }
+}
+
+private String readable(JsonValue value) {
+  return switch value {
+    case String(String text) { break if text.isEmpty() { "无" } else { text } }
+    case Number(String number) { break number }
+    case Boolean(Boolean flag) { break if flag { "是" } else { "否" } }
+    case Null { break "未知" }
+    case Array(List<JsonValue> items) {
+      String result = ""
+      for JsonValue item : items {
+        if !result.isEmpty() { result = result + "；" }
+        result = result + readable(value: item)
+      }
+      break if result.isEmpty() { "无" } else { result }
+    }
+    case Object(Map<String, JsonValue> fields) { break writeJson(value: JsonValue.Object(fields: fields)) }
+  }
+}
+
+public value Report {
+  String status
+  Boolean? changed
+  Facts data
+  List<Problem> issues
+  String description
+  Integer exitCode
+
+  public String render(Boolean json) {
+    if !json {
+      String problems = "无。"
+      if issues.size() != 0 {
+        problems = ""
+        for Problem issue : issues { problems = problems + issue.code + "：" + issue.message + "；" }
+      }
+      String change = "未知"
+      Boolean? actual = changed
+      if actual != null { change = if actual { "是" } else { "否" } }
+      return "结果：" + description + "（" + status + "）\n留下仓库变化：" + change + data.render() + "\n问题：" + problems
+    }
+    Map<String, JsonValue> result = Map<>()
+    result.put(key: "status", value: JsonValue.String(value: status))
+    Boolean? actual = changed
+    JsonValue change = JsonValue.Null
+    if actual != null { change = JsonValue.Boolean(value: actual) }
+    result.put(key: "changed", value: change)
+    result.put(key: "data", value: data.json())
+    List<JsonValue> problems = []
+    for Problem issue : issues {
+      Facts item = Facts()
+      item.text(key: "code", value: issue.code)
+      item.text(key: "message", value: issue.message)
+      problems.add(item.json())
+    }
+    Map<String, JsonValue> root = Map<>()
+    root.put(key: "result", value: JsonValue.Object(fields: result))
+    root.put(key: "issues", value: JsonValue.Array(values: problems))
+    return writeJson(value: JsonValue.Object(fields: root))
+  }
+}
+
+public Report rejected(Problem problem, Integer exitCode = 2) {
+  return Report(status: "failed", changed: false, data: Facts(), issues: [problem], description: "目标未完成，未执行写操作。", exitCode: exitCode)
+}

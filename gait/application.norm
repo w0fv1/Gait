@@ -1,0 +1,81 @@
+package gait
+
+import std.application.arguments
+import std.application.workingDirectory
+import std.application.setExitCode
+import std.cli.CommandLine
+import std.cli.Option
+import std.cli.OptionKind
+import std.cli.CliException
+import std.io.printError
+import std.io.standardInput
+import std.io.readAll
+import std.io.decodeText
+import std.io.TextEncoding
+import std.text.join
+import std.core.Exception
+import openai.OpenAiException
+import std.json.writeJson
+
+Void main() {
+  Boolean json = false
+  Boolean initialization = false
+  try {
+    CommandLine cli = CommandLine(name: "gait", description: "一次请求、一次回复的通用 Agent，按需使用 Git 工具。", options: [
+      Option(name: "repo", description: "Git 工具的工作目录", kind: OptionKind.Value),
+      Option(name: "format", description: "text 或 json 结果", kind: OptionKind.Value),
+      Option(name: "stdin", description: "从标准输入读取完整请求", kind: OptionKind.Flag),
+      Option(name: "init", description: "填写、测试并保存模型配置", kind: OptionKind.Flag),
+      Option(name: "help", description: "显示用法", kind: OptionKind.Flag)
+    ])
+    var parsed = cli.parse(arguments: arguments(), stopAtPositional: true)
+    initialization = parsed.has(name: "init")
+    String format = parsed.value(name: "format") ?? "text"
+    if format != "json" && format != "text" { throw Problem(code: "INVALID_ARGUMENT", message: "--format 只能是 json 或 text。") }
+    json = format == "json"
+    if parsed.has(name: "help") {
+      Facts data = Facts()
+      data.text(key: "usage", value: cli.help())
+      data.strings(key: "examples", value: ["gait 回复ok", "gait show the current repository status", "gait --stdin"])
+      var report = Report(status: "ok", changed: false, data: data, issues: [], description: "支持状态、差异、分支、暂存和提交工具，以及直接回答。", exitCode: 0)
+      printLine(report.render(json: json))
+      return
+    }
+    if parsed.has(name: "init") {
+      if parsed.has(name: "stdin") || parsed.has(name: "repo") || parsed.positionals.size() != 0 { throw Problem(code: "INVALID_ARGUMENT", message: "--init 不能与请求输入或 --repo 同时使用。") }
+      Report report = initialize()
+      printLine(report.render(json: json))
+      setExitCode(code: report.exitCode)
+      return
+    }
+    if parsed.has(name: "stdin") && parsed.positionals.size() != 0 { throw Problem(code: "INVALID_ARGUMENT", message: "--stdin 与命令行请求互斥。") }
+    String input = join(values: parsed.positionals, separator: " ")
+    if parsed.has(name: "stdin") { input = decodeText(content: readAll(reader: standardInput(), maximumBytes: 65536), encoding: TextEncoding.Utf8) }
+    if input.isBlank { throw Problem(code: "MISSING_ARGUMENT", message: "请提供请求；使用 --help 查看示例。") }
+    String directory = parsed.value(name: "repo") ?? workingDirectory().value
+    runAgent(input: input, directory: directory, json: json)
+  } catch CliException error {
+    emitFailure(problem: Problem(code: "INVALID_ARGUMENT", message: error.message), json: json, initialization: initialization)
+    setExitCode(code: 2)
+  } catch Problem error {
+    emitFailure(problem: error, json: json, initialization: initialization)
+    setExitCode(code: 2)
+  } catch OpenAiException error {
+    emitFailure(problem: Problem(code: "AI_ERROR", message: error.message), json: json, initialization: initialization)
+    setExitCode(code: 1)
+  } catch Exception error {
+    emitFailure(problem: Problem(code: "RUNTIME_ERROR", message: error.message), json: json, initialization: initialization)
+    setExitCode(code: 1)
+  }
+}
+
+private Void emitFailure(Problem problem, Boolean json, Boolean initialization) {
+  if initialization { printLine(rejected(problem: problem).render(json: json)) }
+  else if json {
+    Facts event = Facts()
+    event.text(key: "type", value: "error")
+    event.text(key: "code", value: problem.code)
+    event.text(key: "message", value: problem.message)
+    printLine(writeJson(value: event.json()))
+  } else { printError(text: "错误：" + problem.code + "：" + problem.message + "\n") }
+}

@@ -1,0 +1,182 @@
+package gait
+
+import std.process.runProcess
+import std.process.ProcessOutcome
+import std.filesystem.Path
+import std.filesystem.readText
+import std.filesystem.FileException
+import std.filesystem.FileFailure
+import std.io.decodeText
+import std.io.encodeText
+import std.io.TextEncoding
+import std.io.TextException
+import std.io.Bytes
+import std.io.bytes
+import std.time.duration
+import std.json.JsonValue
+
+public value GitReply {
+  Integer code
+  String output
+  String error
+  Boolean truncated
+}
+
+public value Change {
+  String code
+  String path
+  public Boolean conflicted() { return code.contains(value: "U") || code == "AA" || code == "DD" }
+}
+
+public value Observation {
+  String head
+  String branch
+  String status
+  String index
+  String refs
+  String worktree
+  String untracked
+  List<String> operations
+  Boolean detailed
+
+  public List<Change> changes() {
+    List<Change> result = []
+    var entries = status.split(separator: nulSeparator())
+    Integer cursor = 0
+    for cursor < entries.size() {
+      String entry = entries[cursor]
+      cursor = cursor + 1
+      if !entry.isEmpty() {
+        String xy = entry.sliceCodePoints(start: 0, end: 2)
+        result.add(Change(code: xy, path: entry.sliceCodePoints(start: 3, end: entry.codePointSize())))
+        if xy != "??" && (xy.contains(value: "R") || xy.contains(value: "C")) { cursor = cursor + 1 }
+      }
+    }
+    return result
+  }
+
+  public Facts facts() {
+    Integer staged = 0
+    Integer unstaged = 0
+    Integer untrackedCount = 0
+    Integer conflicts = 0
+    List<JsonValue> changes = []
+    for Change change : this.changes() {
+      Facts entry = Facts()
+      entry.text(key: "path", value: change.path)
+      entry.text(key: "status", value: change.code)
+      changes.add(entry.json())
+      String xy = change.code
+      if xy == "??" { untrackedCount = untrackedCount + 1 }
+      else {
+        if change.conflicted() { conflicts = conflicts + 1 }
+        if xy.sliceCodePoints(start: 0, end: 1) != " " { staged = staged + 1 }
+        if xy.sliceCodePoints(start: 1, end: 2) != " " { unstaged = unstaged + 1 }
+      }
+    }
+    Facts result = Facts()
+    result.text(key: "branch", value: branch)
+    result.text(key: "head", value: head)
+    result.number(key: "staged", value: staged)
+    result.number(key: "unstaged", value: unstaged)
+    result.number(key: "untracked", value: untrackedCount)
+    result.number(key: "conflicts", value: conflicts)
+    result.strings(key: "operations", value: operations)
+    result.values.put(key: "changes", value: JsonValue.Array(values: changes))
+    return result
+  }
+}
+
+public class Git {
+  String root
+
+  Git(String directory) {
+    this.root = directory
+    GitReply found = this.run(arguments: ["rev-parse", "--show-toplevel"])
+    if found.code != 0 || found.truncated { throw Problem(code: "NOT_REPOSITORY", message: "指定目录不是可用的 Git 工作区。") }
+    this.root = gitLine(value: found.output)
+  }
+
+  public GitReply run(List<String> arguments, String input = "", Integer budget = 4194304) {
+    List<String> command = ["--no-pager", "-c", "color.ui=false", "-c", "core.quotepath=false", "-c", "i18n.logOutputEncoding=UTF-8", "-C", root]
+    for String argument : arguments { command.add(argument) }
+    Map<String, String> environment = Map<>()
+    environment.put(key: "GIT_OPTIONAL_LOCKS", value: "0")
+    environment.put(key: "GIT_TERMINAL_PROMPT", value: "0")
+    environment.put(key: "GIT_LITERAL_PATHSPECS", value: "1")
+    var result = runProcess(executable: "git", arguments: command, environment: environment,
+      input: encodeText(text: input, encoding: TextEncoding.Utf8), maximumOutputBytes: budget,
+      timeout: duration(seconds: 30, nanoseconds: 0))
+    if result.outcome != ProcessOutcome.Exited { throw Problem(code: "GIT_ERROR", message: "Git 进程超时或被取消。") }
+    String output = gitText(bytes: result.stdout, truncated: result.stdoutTruncated)
+    String error = gitText(bytes: result.stderr, truncated: result.stderrTruncated)
+    return GitReply(code: result.exitCode ?? -1, output: output, error: error,
+      truncated: result.stdoutTruncated || result.stderrTruncated)
+  }
+
+  public String require(List<String> arguments) {
+    GitReply reply = this.run(arguments: arguments)
+    if reply.truncated { throw Problem(code: "OUTPUT_TRUNCATED", message: "仓库事实超过读取预算，无法完整检查。") }
+    if reply.code != 0 { throw Problem(code: "GIT_ERROR", message: reply.error.trim()) }
+    return reply.output
+  }
+
+  public String resolveRef(String name) {
+    GitReply reply = this.run(arguments: ["rev-parse", "--verify", "--quiet", name])
+    if reply.code == 1 { return "" }
+    if reply.code != 0 || reply.truncated { throw Problem(code: "GIT_ERROR", message: "无法读取 Git 引用。") }
+    return reply.output.trim()
+  }
+
+  public Observation observe(Boolean detailed = false) {
+    String head = this.resolveRef(name: "HEAD")
+    GitReply symbolic = this.run(arguments: ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    if symbolic.code != 0 && symbolic.code != 1 { throw Problem(code: "GIT_ERROR", message: "无法读取当前分支。") }
+    String branch = symbolic.output.trim()
+    String status = this.require(arguments: ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    List<String> operations = []
+    for String marker : ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge/head-name", "rebase-apply/head-name", "sequencer/todo", "BISECT_START"] {
+      String path = gitLine(value: this.require(arguments: ["rev-parse", "--path-format=absolute", "--git-path", marker]))
+      try {
+        readText(path: Path(value: path), encoding: TextEncoding.Utf8, maximumBytes: 1048576)
+        operations.add(marker)
+      } catch FileException error {
+        if error.reason != FileFailure.NotFound { throw error }
+      }
+    }
+    String index = ""
+    String refs = ""
+    String worktree = ""
+    String untracked = ""
+    if detailed {
+      index = this.require(arguments: ["ls-files", "--stage", "-z"])
+      refs = this.require(arguments: ["for-each-ref", "--format=%(refname)%00%(objectname)"])
+      worktree = this.require(arguments: ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames"])
+      var paths = this.require(arguments: ["ls-files", "--others", "--exclude-standard", "-z"]).split(separator: nulSeparator())
+      if paths.size() > 513 { throw Problem(code: "OUTPUT_TRUNCATED", message: "未跟踪文件超过状态核对预算，请缩小工作区。") }
+      for String path : paths {
+        if !path.isEmpty() { untracked = untracked + path + nulSeparator() + this.require(arguments: ["hash-object", "--no-filters", "--", path]) }
+      }
+    }
+    return Observation(head: head, branch: branch, status: status, index: index, refs: refs,
+      worktree: worktree, untracked: untracked, operations: operations, detailed: detailed)
+  }
+}
+
+private String gitText(Bytes bytes, Boolean truncated) {
+  Integer trim = 0
+  for trim <= 3 && trim <= bytes.size() {
+    try { return decodeText(content: bytes.slice(start: 0, length: bytes.size() - trim), encoding: TextEncoding.Utf8) }
+    catch TextException error {
+      if !truncated || trim == 3 { throw Problem(code: "OUTPUT_ENCODING", message: "Git 输出不是有效的 UTF-8。") }
+    }
+    trim = trim + 1
+  }
+  throw Problem(code: "OUTPUT_ENCODING", message: "无法解码 Git 输出。")
+}
+
+public String nulSeparator() { return decodeText(content: bytes(values: [0]), encoding: TextEncoding.Utf8) }
+
+private String gitLine(String value) {
+  return if value.endsWith(suffix: "\n") { value.sliceCodePoints(start: 0, end: value.codePointSize() - 1) } else { value }
+}
