@@ -8,11 +8,10 @@ import std.filesystem.writeTextAtomic
 import std.io.TextEncoding
 import std.json.parseJson
 import std.json.writeJson
-import std.http.Uri
 import openai.Client
 import openai.ResponseInput
 import openai.ResponseRequest
-import openai.StructuredOutput
+import openai.structuredOutput
 import openai.StructuredOutputMode
 import openai.OpenAiException
 
@@ -27,9 +26,9 @@ public Report configure(AiConfig candidate, UserConfig previous) {
   }
   String endpoint = responsesEndpoint(address: candidate.endpoint)
   try {
-    Client client = Client(apiKey: key, endpoint: Uri(value: endpoint))
-    var response = client.create(request: ResponseRequest(model: model, input: ResponseInput.Text(value: "Verify that this connection supports structured responses. Return ok true."),
-      format: StructuredOutput(mode: StructuredOutputMode.JsonObject, name: "connection_probe", schema: parseJson(value: "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"],\"additionalProperties\":false}"))))
+    Client client = Client(apiKey: key, model: model, endpoint: endpoint)
+    var response = client.exchange(request: ResponseRequest(model: model, input: ResponseInput.Text(value: "Verify that this connection supports structured responses. Return ok true."),
+      format: structuredOutput<ConnectionProbe>(mode: StructuredOutputMode.JsonObject, name: "connection_probe")), stream: false)
     ConnectionProbe probe = response.decode<ConnectionProbe>()
     if !probe.ok { throw Problem(code: "CONFIG_TEST_FAILED", message: "模型未通过连接测试。") }
   } catch OpenAiException error {

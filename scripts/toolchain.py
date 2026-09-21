@@ -24,7 +24,7 @@ def prepare():
     source = norm / 'norm/libraries/openai'
     target = ROOT / 'dependencies/openai'
     target.mkdir(parents=True, exist_ok=True)
-    for name in ('module.norm', 'client.norm'):
+    for name in sorted(path.name for path in source.glob('*.norm')):
         destination = (target / name).resolve()
         if destination != (source / name).resolve():
             if not destination.is_relative_to(ROOT):

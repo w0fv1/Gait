@@ -2,14 +2,19 @@ package gait
 
 import std.json.JsonValue
 import std.json.writeJson
-import std.http.Uri
+import std.core.Exception
+import std.json.fromJson
+import std.json.JsonException
+import openai.ToolRegistry
+import openai.OpenAiException
 import std.io.printError
 import std.io.print
 import openai.Client
+import openai.GenerationCallbacks
 import openai.ResponseRequest
 import openai.ResponseInput
 import openai.ResponseStatus
-import openai.FunctionCall
+import openai.ToolCall
 
 private class StreamOutput {
   public Boolean written = false
@@ -20,7 +25,8 @@ private class StreamOutput {
 }
 
 public Void runAgent(String input, String directory, Boolean json) {
-  AgentTools tools = AgentTools(directory: directory)
+  AgentTools tools = AgentTools(directory: directory, userMessages: input)
+  ToolRegistry registry = ToolRegistry(tools: tools.functions())
   Facts user = Facts()
   user.text(key: "role", value: "user")
   user.text(key: "content", value: input)
@@ -35,31 +41,35 @@ public Void runAgent(String input, String directory, Boolean json) {
     String? key = config.apiKey
     String? model = config.model
     if key == null || model == null { throw Problem(code: "CONFIG_REQUIRED", message: "请先运行 --init 配置模型连接。") }
-    Client client = Client(apiKey: key, endpoint: Uri(value: config.endpoint))
+    Client client = Client(apiKey: key, model: model, endpoint: config.endpoint)
     if writeJson(value: JsonValue.Array(values: history)).codePointSize() > 60000 {
       printError(text: "正在整理本次任务上下文，保留目标和已执行操作……\n")
       history = compactContext(client: client, model: model, goal: input, history: history, effects: effects)
     }
     StreamOutput output = StreamOutput()
-    var response = client.create(request: ResponseRequest(model: model, input: ResponseInput.Items(values: history), tools: tools.definitions(), maximumOutputTokens: 8192,
-        instructions: agentInstructions(model: model, endpoint: config.endpoint)), onText: (String delta) {
+    var response = client.exchange(request: ResponseRequest(model: model, input: ResponseInput.Items(values: history), tools: registry.definitions(), maximumOutputTokens: 8192,
+        instructions: agentInstructions(model: model, endpoint: config.endpoint)), callbacks: GenerationCallbacks(onText: (String delta) {
         if !json { output.accept(delta: delta) }
-      })
+      }))
     if output.written { print(text: "\n") }
     if response.status != ResponseStatus.Completed {
       throw Problem(code: "AI_INCOMPLETE", message: "模型响应未完成，未执行该响应中的工具。")
     }
     Map<String, Boolean> identifiers = Map<>()
-    for FunctionCall call : response.calls {
+    for ToolCall call : response.calls {
       if call.callId.isBlank || identifiers.containsKey(key: call.callId) { throw Problem(code: "AI_ERROR", message: "模型返回重复或空的工具调用标识。") }
       identifiers.put(key: call.callId, value: true)
     }
     for JsonValue item : response.output { history.add(item) }
-    for FunctionCall call : response.calls {
+    for ToolCall call : response.calls {
       String details = if call.name == "git_read_files" || call.name == "git_summarize_file" { " " + call.arguments } else { "" }
       printError(text: "工具：" + call.name + details + "\n")
-      Report result = tools.invoke(call: call, userMessages: input)
-      String output = result.render(json: true)
+      String output = ""
+      try { output = fromJson<String>(value: registry.invoke(call: call)) }
+      catch Problem error { output = rejected(problem: error).render(json: true) }
+      catch JsonException error { output = rejected(problem: Problem(code: "INVALID_ARGUMENT", message: "工具参数字段或类型无效。")).render(json: true) }
+      catch OpenAiException error { output = rejected(problem: Problem(code: if error.code == "OPENAI-UNKNOWN-TOOL" { "UNKNOWN_TOOL" } else { error.code }, message: error.message)).render(json: true) }
+      catch Exception error { output = rejected(problem: Problem(code: "TOOL_ERROR", message: error.message), exitCode: 1).render(json: true) }
       Facts value = Facts()
       value.text(key: "type", value: "function_call_output")
       value.text(key: "call_id", value: call.callId)

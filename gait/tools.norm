@@ -1,12 +1,8 @@
 package gait
 
 import std.core.Exception
-import std.serialization.Serializable
-import std.json.parseJson
-import std.json.fromJson
-import std.json.JsonException
-import openai.FunctionTool
-import openai.FunctionCall
+import openai.Tool
+import openai.ToolParameter
 
 public enum ActionKind { Status, CreateBranch, SwitchBranch, CreateAndSwitch, Diff, ReadFiles, SummarizeFile, Stage, Commit }
 
@@ -20,97 +16,91 @@ public value Action {
   Integer lineCount = 80
 }
 
-@Serializable()
-private value EmptyArguments {}
-@Serializable()
-private value BranchArguments { String branch }
-@Serializable()
-private value PathArguments { List<String> paths }
-@Serializable()
-private value ReadArguments { List<String> paths Integer? startLine Integer? lineCount }
-@Serializable()
-private value SummaryArguments { String path String? focus }
-@Serializable()
-private value DiffArguments { List<String> paths Boolean staged }
-@Serializable()
-private value CommitArguments { String message }
-@Serializable()
-private value ConfigArguments { String apiKey String model String endpoint }
-
-private value ToolDefinition { FunctionTool definition ActionKind? kind }
-
 public class AgentTools {
   private String directory
+  private String userMessages
   private Git? git = null
   private Observation? observation = null
-  private List<ToolDefinition> registry
 
-  AgentTools(String directory) {
+  AgentTools(String directory, String userMessages) {
     this.directory = directory
-    this.registry = [
-      ToolDefinition(definition: FunctionTool(name: "git_status", description: "Read the current repository status. Use before planning repository changes.", parameters: parseJson(value: "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}")), kind: ActionKind.Status),
-      ToolDefinition(definition: FunctionTool(name: "git_summarize_file", description: "Preferred tool for understanding ONE repository file. A separate model call reads its full bounded content and returns a concise summary, keeping raw source out of the main context. Set focus to the question or summarization angle, e.g. commit theme, interfaces, or tests. Does not inspect the actual Git diff or execute operations.", parameters: parseJson(value: "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"focus\":{\"type\":\"string\",\"maxLength\":2000}},\"required\":[\"path\"],\"additionalProperties\":false}")), kind: ActionKind.SummarizeFile),
-      ToolDefinition(definition: FunctionTool(name: "git_diff", description: "Read staged or unstaged changes. Empty paths means all tracked changes in that scope.", parameters: parseJson(value: "{\"type\":\"object\",\"properties\":{\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"staged\":{\"type\":\"boolean\"}},\"required\":[\"paths\",\"staged\"],\"additionalProperties\":false}")), kind: ActionKind.Diff),
-      ToolDefinition(definition: branchTool(name: "git_create_branch", description: "Create a branch without switching."), kind: ActionKind.CreateBranch),
-      ToolDefinition(definition: branchTool(name: "git_switch_branch", description: "Switch to an existing local branch."), kind: ActionKind.SwitchBranch),
-      ToolDefinition(definition: branchTool(name: "git_create_and_switch", description: "Create a branch and switch to it."), kind: ActionKind.CreateAndSwitch),
-      ToolDefinition(definition: FunctionTool(name: "git_stage", description: "Stage specified repository-relative paths authorized by the user. Does not commit.", parameters: parseJson(value: "{\"type\":\"object\",\"properties\":{\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"paths\"],\"additionalProperties\":false}")), kind: ActionKind.Stage),
-      ToolDefinition(definition: FunctionTool(name: "git_read_files", description: "Read a page from up to 8 tracked or non-ignored untracked files. Defaults: startLine=1, lineCount=80; maximum lineCount=200. Lines are additions from empty. next_line=0 means EOF; otherwise use it only when further detail is necessary. Binary files are identified. Do not reread a page already inspected.", parameters: parseJson(value: "{\"type\":\"object\",\"properties\":{\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"maxItems\":8},\"startLine\":{\"type\":\"integer\",\"minimum\":1},\"lineCount\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200}},\"required\":[\"paths\"],\"additionalProperties\":false}")), kind: ActionKind.ReadFiles),
-      ToolDefinition(definition: FunctionTool(name: "git_commit", description: "Commit the current index as one batch using the supplied non-empty message. Returns the verified commit hash and resulting repository status.", parameters: parseJson(value: "{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}},\"required\":[\"message\"],\"additionalProperties\":false}")), kind: ActionKind.Commit),
-      ToolDefinition(definition: FunctionTool(name: "configure", description: "Test and save the user's model configuration. Empty strings keep effective values. New credentials and endpoints must be supplied by the user. No Git repository required.", parameters: parseJson(value: "{\"type\":\"object\",\"properties\":{\"apiKey\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"},\"endpoint\":{\"type\":\"string\"}},\"required\":[\"apiKey\",\"model\",\"endpoint\"],\"additionalProperties\":false}")), kind: null)
-    ]
+    this.userMessages = userMessages
   }
 
-  public List<FunctionTool> definitions() {
-    List<FunctionTool> result = []
-    for ToolDefinition tool : registry { result.add(tool.definition) }
-    return result
+  public List<Function<?>> functions() {
+    return [this.status, this.summarize, this.diff, this.createBranch, this.switchBranch,
+      this.createAndSwitch, this.stage, this.readFiles, this.commit, this.configureModel]
   }
 
-  public Report invoke(FunctionCall call, String userMessages) {
+  @Tool(name: "git_status", description: "Read the current repository status. Use before planning repository changes.")
+  public String status() {
+    return this.perform(action: Action(kind: ActionKind.Status))
+  }
+
+  @Tool(name: "git_diff", description: "Read staged or unstaged changes. Empty paths means all tracked changes in that scope.")
+  public String diff(List<String> paths, Boolean staged) {
+    return this.perform(action: Action(kind: ActionKind.Diff, paths: paths, staged: staged))
+  }
+
+  @Tool(name: "git_create_branch", description: "Create a branch without switching.")
+  public String createBranch(String branch) {
+    return this.perform(action: Action(kind: ActionKind.CreateBranch, branch: branch))
+  }
+
+  @Tool(name: "git_switch_branch", description: "Switch to an existing local branch.")
+  public String switchBranch(String branch) {
+    return this.perform(action: Action(kind: ActionKind.SwitchBranch, branch: branch))
+  }
+
+  @Tool(name: "git_create_and_switch", description: "Create a branch and switch to it.")
+  public String createAndSwitch(String branch) {
+    return this.perform(action: Action(kind: ActionKind.CreateAndSwitch, branch: branch))
+  }
+
+  @Tool(name: "git_stage", description: "Stage specified repository-relative paths authorized by the user. Does not commit.")
+  public String stage(List<String> paths) {
+    return this.perform(action: Action(kind: ActionKind.Stage, paths: paths))
+  }
+
+  @Tool(name: "git_read_files", description: "Read a page from up to 8 tracked or non-ignored untracked files. Defaults: startLine=1, lineCount=80; maximum lineCount=200. Lines are additions from empty. next_line=0 means EOF; otherwise use it only when further detail is necessary. Binary files are identified. Do not reread a page already inspected.")
+  public String readFiles(List<String> paths, Integer startLine = 1, Integer lineCount = 80) {
+    return this.perform(action: Action(kind: ActionKind.ReadFiles, paths: paths, startLine: startLine, lineCount: lineCount))
+  }
+
+  @Tool(name: "git_commit", description: "Commit the current index as one batch using the supplied non-empty message. Returns the verified commit hash and resulting repository status.")
+  public String commit(String message) {
+    return this.perform(action: Action(kind: ActionKind.Commit, message: message))
+  }
+
+  @Tool(name: "git_summarize_file", description: "Preferred tool for understanding ONE repository file. A separate model call reads its full bounded content and returns a concise summary, keeping raw source out of the main context. Set focus to the question or summarization angle, e.g. commit theme, interfaces, or tests. Does not inspect the actual Git diff or execute operations.")
+  public String summarize(String path, @ToolParameter(description: "The question or summarization angle") String? focus) {
+    Git current = git ?? Git(directory: directory)
+    git = current
+    return summarizeFile(git: current, path: path, focus: focus ?? "文件用途、关键行为、依赖与相关测试").render(json: true)
+  }
+
+  @Tool(name: "configure", description: "Test and save the user's model configuration. Empty strings keep effective values. New credentials and endpoints must be supplied by the user. No Git repository required.")
+  public String configureModel(String apiKey, String model, String endpoint) {
+    UserConfig previous = loadConfiguration()
+    if !apiKey.isEmpty() && apiKey != previous.effective.apiKey && !userMessages.contains(value: apiKey) { throw Problem(code: "INVALID_ARGUMENT", message: "新密钥必须来自用户消息。") }
+    if !model.isEmpty() && model != previous.effective.model && !userMessages.contains(value: model) { throw Problem(code: "INVALID_ARGUMENT", message: "新模型名称必须来自用户消息。") }
+    String address = endpoint
+    if address.endsWith(suffix: "/responses") { address = address.sliceCodePoints(start: 0, end: address.codePointSize() - 10) }
+    if !endpoint.isEmpty() && responsesEndpoint(address: endpoint) != previous.effective.endpoint && !userMessages.contains(value: address) { throw Problem(code: "INVALID_ARGUMENT", message: "新接口地址必须来自用户消息。") }
+    return configure(candidate: AiConfig(apiKey: if apiKey.isEmpty() { previous.effective.apiKey } else { apiKey },
+      model: if model.isEmpty() { previous.effective.model } else { model },
+      endpoint: if endpoint.isEmpty() { previous.effective.endpoint } else { endpoint }), previous: previous).render(json: true)
+  }
+
+  private String perform(Action action) {
     try {
-      ToolDefinition? selected = null
-      for ToolDefinition tool : registry { if tool.definition.name == call.name { selected = tool } }
-      if selected == null { throw Problem(code: "UNKNOWN_TOOL", message: "未知工具。") }
-      ActionKind? kind = selected.kind
-      if kind == ActionKind.SummarizeFile {
-        SummaryArguments args = fromJson<SummaryArguments>(value: call.arguments)
-        Git current = git ?? Git(directory: directory)
-        git = current
-        return summarizeFile(git: current, path: args.path, focus: args.focus ?? "文件用途、关键行为、依赖与相关测试")
-      }
-      if kind == null {
-        ConfigArguments args = fromJson<ConfigArguments>(value: call.arguments)
-        UserConfig previous = loadConfiguration()
-        if !args.apiKey.isEmpty() && args.apiKey != previous.effective.apiKey && !userMessages.contains(value: args.apiKey) { throw Problem(code: "INVALID_ARGUMENT", message: "新密钥必须来自用户消息。") }
-        if !args.model.isEmpty() && args.model != previous.effective.model && !userMessages.contains(value: args.model) { throw Problem(code: "INVALID_ARGUMENT", message: "新模型名称必须来自用户消息。") }
-        String endpoint = args.endpoint
-        if endpoint.endsWith(suffix: "/responses") { endpoint = endpoint.sliceCodePoints(start: 0, end: endpoint.codePointSize() - 10) }
-        if !args.endpoint.isEmpty() && responsesEndpoint(address: args.endpoint) != previous.effective.endpoint && !userMessages.contains(value: endpoint) { throw Problem(code: "INVALID_ARGUMENT", message: "新接口地址必须来自用户消息。") }
-        return configure(candidate: AiConfig(apiKey: if args.apiKey.isEmpty() { previous.effective.apiKey } else { args.apiKey },
-          model: if args.model.isEmpty() { previous.effective.model } else { args.model },
-          endpoint: if args.endpoint.isEmpty() { previous.effective.endpoint } else { args.endpoint }), previous: previous)
-      }
-      Action action = switch kind {
-        case Status { var args = fromJson<EmptyArguments>(value: if call.arguments.isBlank { "{}" } else { call.arguments }) break Action(kind: kind) }
-        case Diff { var args = fromJson<DiffArguments>(value: call.arguments) break Action(kind: kind, paths: args.paths, staged: args.staged) }
-        case Stage { var args = fromJson<PathArguments>(value: call.arguments) break Action(kind: kind, paths: args.paths) }
-        case ReadFiles { var args = fromJson<ReadArguments>(value: call.arguments) break Action(kind: kind, paths: args.paths, startLine: args.startLine ?? 1, lineCount: args.lineCount ?? 80) }
-        case Commit { var args = fromJson<CommitArguments>(value: call.arguments) break Action(kind: kind, message: args.message) }
-        case _ { var args = fromJson<BranchArguments>(value: call.arguments) break Action(kind: kind, branch: args.branch) }
-      }
       Git current = git ?? Git(directory: directory)
       git = current
+      ActionKind kind = action.kind
       Observation initial = if kind == ActionKind.Status { current.observe(detailed: true) } else { observation ?? current.observe(detailed: true) }
       Report result = execute(git: current, action: action, initial: initial)
       observation = if kind == ActionKind.Status { initial } else { if kind == ActionKind.Diff || kind == ActionKind.ReadFiles { current.observe(detailed: true) } else { null } }
-      return result
-    } catch Problem error { observation = null return rejected(problem: error) }
-    catch JsonException error { return rejected(problem: Problem(code: "INVALID_ARGUMENT", message: "工具参数字段或类型无效。")) }
-    catch Exception error { observation = null return rejected(problem: Problem(code: "TOOL_ERROR", message: error.message), exitCode: 1) }
+      return result.render(json: true)
+    } catch Exception error { observation = null throw error }
   }
-}
-
-private FunctionTool branchTool(String name, String description) {
-  return FunctionTool(name: name, description: description, parameters: parseJson(value: "{\"type\":\"object\",\"properties\":{\"branch\":{\"type\":\"string\"}},\"required\":[\"branch\"],\"additionalProperties\":false}"))
 }

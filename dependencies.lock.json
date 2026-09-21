@@ -1,8 +1,11 @@
 {
   "norm_files": {
-    "norm/libraries/openai/module.norm": "64411e1cff5b8f6fa4392f577df72fde7896136a33daa33f1396b6df7bbf009d",
-    "norm/libraries/openai/client.norm": "2ec7e6d9e056e5bfa6fee58cc4e2ead652fc16aadf536c95dddde02b205fe2e8",
-    "cli/compiler/stdlib-abi.json": "882f68808682147f29771c5f93425b2995e0daec8271e67c0ff1086aebe000b7"
+    "norm/libraries/openai/agent.norm": "2d521edbe6cf36dc37180258da578341e4909deb9f3a34676b085cac8ee46966",
+    "norm/libraries/openai/client.norm": "c63c5583040af858921fefa6385ce24d2136093417820a0766c474e82f63b972",
+    "norm/libraries/openai/events.norm": "25e339af85c034a1637c33fe21d8ed7ea9697c0ef9e766197eb1bb9b065173b4",
+    "norm/libraries/openai/module.norm": "2f88c7ed67de2d26e0df9fbe773a7133c8b380dcb49734da35595ce4282297a4",
+    "norm/libraries/openai/tools.norm": "95fa7c05a9bb75dec65ac608e7e52d02e08d82d400a003f28a3c248a9147947f",
+    "cli/compiler/stdlib-abi.json": "9446ea1dfc8fd36e24206c949eb479e65821a0d8605c162d66e592f3ba2015b4"
   },
   "hash": "sha256-utf8-lf"
 }
