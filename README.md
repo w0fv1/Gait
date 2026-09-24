@@ -4,11 +4,17 @@
 
 ## 获取与构建
 
-从 [GitHub 仓库](https://github.com/w0fv1/Gait) 克隆源码。当前尚未发布预编译版本；下文的 `dist/gait.exe` 需要先按[开发](#开发)一节构建。构建需要 [Norm](https://github.com/normlanguage/Norm) 源码、Python 和 JDK 25。将 Norm 放在 Gait 同级目录，或通过 `NORM_HOME` 指定路径。`prepare` 会核对 `dependencies.lock.json` 中的依赖指纹，避免使用不匹配的 Norm 源码。
+Gait 的编译命令是 `norm build gait`，在仓库根目录运行；首次本机编译时 Norm 会准备自己的 Native Image 工具链。需要**兼容本仓库所用接口**的 [Norm](https://github.com/normlanguage/Norm) CLI。当前公开的 Norm `v0.24.0` 尚不兼容；本仓库已用 Norm 源码提交 `6c3e1c5` 构建的 CLI 验证。在兼容的 Norm 安装版发布前，需要先从该源码构建 Norm CLI（Norm 自身使用 Maven），再用它执行以下命令。当前尚未发布 Gait 预编译版本。
 
 ```powershell
-.\dist\gait.exe 回复ok
-.\dist\gait.exe show the current repository status
+norm build gait
+```
+
+产物位于 `gait/build/gait.exe`（Windows）；其他系统为 `gait/build/gait`。本仓库已包含所需的 OpenAI Norm 模块源码，不再需要额外复制这个依赖。Norm 发布兼容安装版后，Gait 的构建将只需安装该 CLI 并运行上面的 `norm build`。
+
+```powershell
+.\gait\build\gait.exe 回复ok
+.\gait\build\gait.exe show the current repository status
 ```
 
 每次调用接收一个请求，输出一次最终回答后立即退出。下次调用不记忆前文，不读取或保存会话。中英文可以直接输入，PowerShell 特殊字符需要引号或转义。
@@ -24,7 +30,7 @@
 ## 模型配置
 
 ```powershell
-.\dist\gait.exe --init
+.\gait\build\gait.exe --init
 ```
 
 依次填写密钥、模型和接口地址；方括号显示当前值，密钥显示为 `******`，回车保留。支持完整的 `/responses` 和 `/chat/completions` 地址，按地址选择协议。以 `/v1` 或 `/v1/` 结尾的 Base URL 自动补成 `/v1/responses`。MiMo Token Plan 使用 `https://token-plan-cn.xiaomimimo.com/v1/chat/completions`。
@@ -48,9 +54,9 @@ Windows 配置位于 `%APPDATA%\gait\config.json`，缺少 APPDATA 时使用 `%U
 Git 工具通过参数数组执行，保留路径、冲突与写后验证。模型可以在本次请求内多步调用工具，工具中间结果只用于本次推理，工具参数在完整响应结束并校验后才执行。不提供任意 Shell 执行能力。
 
 ```powershell
-.\dist\gait.exe --repo C:\path\to\repo 查看状态
-.\dist\gait.exe --format json 查看状态
-.\dist\gait.exe --stdin
+.\gait\build\gait.exe --repo C:\path\to\repo 查看状态
+.\gait\build\gait.exe --format json 查看状态
+.\gait\build\gait.exe --stdin
 ```
 
 `--repo` 选择 Git 工具目录，默认当前目录。`--format json` 输出一个 JSON 结果，包含最终 `text` 和 `tools` 记录。`--stdin` 读取到 EOF，将多行内容作为一个完整请求，与命令行请求互斥。工具名称输出到 stderr。未提供请求时提示用法并退出；`--init` 仍提供逐项配置。
@@ -59,9 +65,9 @@ Git 工具通过参数数组执行，保留路径、冲突与写后验证。模�
 
 ## 开发
 
-运行产物为 `dist/gait.exe`，需要 PATH 中的 Git 来执行 Git 工具。应用不依赖 Python 或 Java。
+运行产物为 `gait/build/gait.exe`，需要 PATH 中的 Git 来执行 Git 工具。应用不依赖 Python 或 Java。
 
-源码开发需要 Python、JDK 25 和同级 Norm 工作区，可用 `NORM_HOME` 指定 Norm 目录。先在 Norm 目录用 Maven wrapper 构建运行时（Windows：`.\mvnw.cmd -DskipTests package`；其他系统：`./mvnw -DskipTests package`），再执行：
+直接修改源码后运行 `norm build gait` 即可重新编译。开发脚本需要 Python 和兼容的 Norm CLI（通过 PATH 或 `NORM_CLI` 指定），可用于运行源码、校验依赖指纹并把构建产物复制到 `dist/`：
 
 ```text
 python scripts/manage.py prepare
@@ -69,15 +75,16 @@ python scripts/manage.py run -- 回复ok
 python scripts/manage.py build
 ```
 
-依赖指纹见 [dependencies.lock.json](dependencies.lock.json)。请求、工具和初始化验收见 [tests](tests)，结构见 [docs/architecture.md](docs/architecture.md)。
+所附 OpenAI 模块的依赖指纹见 [dependencies.lock.json](dependencies.lock.json)。请求、工具和初始化验收见 [tests](tests)，结构见 [docs/architecture.md](docs/architecture.md)。
 
 构建后可运行测试：
 
 ```powershell
-$env:GAIT_EXECUTABLE = (Resolve-Path .\dist\gait.exe).Path
+$env:GAIT_EXECUTABLE = (Resolve-Path .\gait\build\gait.exe).Path
+python -m pip install -r tests/requirements-windows.txt
 python -m unittest discover -s tests -v
 ```
 
 ## 许可证与贡献
 
-Gait 源码以 [MPL-2.0](LICENSE) 发布。构建时使用的 Norm 源码及运行时仍受 [Norm 的许可证与第三方声明](https://github.com/normlanguage/Norm/blob/main/LICENSING.md) 约束；本仓库不会提交复制到 `dependencies/` 的 Norm 源码。贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+Gait 源码以 [MPL-2.0](LICENSE) 发布。`dependencies/openai/` 包含来自 [Norm](https://github.com/normlanguage/Norm/tree/main/norm/libraries/openai) 的 OpenAI 模块源码，其来源和许可证见 [SOURCE.md](dependencies/openai/SOURCE.md)。构建时使用的 Norm 工具链仍受 [Norm 的许可证与第三方声明](https://github.com/normlanguage/Norm/blob/main/LICENSING.md) 约束。贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。

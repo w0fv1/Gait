@@ -1,0 +1,67 @@
+package openai
+
+import std.annotation.FunctionTarget
+import std.annotation.ParameterTarget
+import std.annotation.RuntimeRetention
+import std.json.JsonValue
+import std.json.functionSchema
+import std.json.invokeJson
+
+public annotation Tool implements FunctionTarget, RuntimeRetention {
+  String description
+  String? name
+}
+
+public annotation ToolParameter implements ParameterTarget, RuntimeRetention {
+  String description
+}
+
+public class ToolRegistry {
+  private Map<String, Function<?>> operations = Map<>()
+  private List<ToolDefinition> descriptions = []
+
+  ToolRegistry(List<Function<?>> tools) {
+    this.operations = Map<>()
+    this.descriptions = []
+    for Function<?> operation : tools {
+      Tool? metadata = operation.annotation<Tool>()
+      if metadata == null { throw OpenAiException(code: "OPENAI-INVALID-TOOL", message: "Tool functions require @Tool") }
+      String name = metadata.name ?? operation.name()
+      if name.isBlank || metadata.description.isBlank || operations.containsKey(key: name) {
+        throw OpenAiException(code: "OPENAI-INVALID-TOOL", message: "Tool names must be unique and descriptions must not be empty: " + name)
+      }
+      JsonValue schema = functionSchema(operation: operation)
+      Map<String, JsonValue> fields = switch schema {
+        case Object(Map<String, JsonValue> fields) { break fields }
+        case _ { throw OpenAiException(code: "OPENAI-INVALID-TOOL", message: "Expected an object schema") }
+      }
+      Map<String, JsonValue> properties = switch fields.get(key: "properties") ?? JsonValue.Null {
+        case Object(Map<String, JsonValue> values) { break values }
+        case _ { throw OpenAiException(code: "OPENAI-INVALID-TOOL", message: "Expected parameter properties") }
+      }
+      for Parameter<?> parameter : operation.parameters() {
+        ToolParameter? details = parameter.annotation<ToolParameter>()
+        if details != null {
+          Map<String, JsonValue> property = switch properties.get(key: parameter.name()) ?? JsonValue.Null {
+            case Object(Map<String, JsonValue> values) { break values }
+            case _ { throw OpenAiException(code: "OPENAI-INVALID-TOOL", message: "Missing parameter schema") }
+          }
+          property.put(key: "description", value: JsonValue.String(value: details.description))
+          properties.put(key: parameter.name(), value: JsonValue.Object(fields: property))
+        }
+      }
+      fields.put(key: "properties", value: JsonValue.Object(fields: properties))
+      operations.put(key: name, value: operation)
+      descriptions.add(ToolDefinition(name: name, description: metadata.description, parameters: JsonValue.Object(fields: fields)))
+    }
+  }
+
+  public List<ToolDefinition> definitions() { return descriptions }
+
+  public String invoke(ToolCall call) {
+    Function<?>? operation = operations.get(key: call.name)
+    if operation == null { throw OpenAiException(code: "OPENAI-UNKNOWN-TOOL", message: "Unknown tool: " + call.name) }
+    String arguments = if call.arguments.isBlank && operation.parameters().isEmpty() { "{}" } else { call.arguments }
+    return invokeJson(operation: operation, arguments: arguments)
+  }
+}

@@ -1,5 +1,4 @@
 .tmp/
-dependencies/
 gait/build/
 dist/
 __pycache__/

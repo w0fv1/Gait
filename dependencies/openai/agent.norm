@@ -1,0 +1,84 @@
+package openai
+
+import std.core.Exception
+import std.json.JsonValue
+import std.json.writeJson
+
+public class Agent {
+  private Client client
+  private String? instructions
+  private ToolRegistry registry
+  private Integer maximumRounds
+  private Integer maximumOutputTokens
+
+  Agent(Client client, String? instructions = null, List<Function<?>> tools = [],
+    Integer maximumRounds = 64, Integer maximumOutputTokens = 8192) {
+    if maximumRounds < 1 { throw OpenAiException(code: "OPENAI-INVALID-REQUEST", message: "A positive round limit is required") }
+    this.client = client
+    this.instructions = instructions
+    this.registry = ToolRegistry(tools: tools)
+    this.maximumRounds = maximumRounds
+    this.maximumOutputTokens = maximumOutputTokens
+  }
+
+  public Response run(String input, Function<Void(String)>? onResponseStarted = null,
+    Function<Void(String)>? onMessageStarted = null,
+    Function<Void(String)>? onText = null,
+    Function<Void(Message)>? onMessageCompleted = null,
+    Function<Void(ToolCall)>? onToolCallReceived = null,
+    Function<Void(ToolCall)>? onToolStarted = null,
+    Function<Void(ToolResult)>? onToolCompleted = null,
+    Function<Void(ToolFailure)>? onToolFailed = null,
+    Function<Void(Response)>? onResponseCompleted = null,
+    Function<Void(Exception)>? onFailed = null,
+    Function<Void(String)>? onRunStarted = null,
+    Function<Void(Response)>? onRunCompleted = null,
+    Function<Void(GenerationEvent)>? onEvent = null) {
+    var callbacks = GenerationCallbacks(onResponseStarted: onResponseStarted, onMessageStarted: onMessageStarted, onText: onText, onMessageCompleted: onMessageCompleted, onToolCallReceived: onToolCallReceived, onToolStarted: onToolStarted, onToolCompleted: onToolCompleted, onToolFailed: onToolFailed, onResponseCompleted: onResponseCompleted, onFailed: onFailed, onRunStarted: onRunStarted, onRunCompleted: onRunCompleted, onEvent: onEvent)
+    try {
+      callbacks.emit(event: GenerationEvent.RunStarted(input: input))
+      Map<String, JsonValue> user = Map<>()
+      user.put(key: "role", value: JsonValue.String(value: "user"))
+      user.put(key: "content", value: JsonValue.String(value: input))
+      List<JsonValue> history = [JsonValue.Object(fields: user)]
+      for Integer round : range(start: 0, end: maximumRounds) {
+        var response = client.exchange(request: ResponseRequest(model: client.defaultModel(), input: ResponseInput.Items(values: history),
+          instructions: instructions, tools: registry.definitions(), maximumOutputTokens: maximumOutputTokens), callbacks: callbacks)
+        if response.status != ResponseStatus.Completed || response.refusal != null || response.calls.isEmpty() {
+          callbacks.emit(event: GenerationEvent.RunCompleted(response: response))
+          return response
+        }
+        Map<String, Boolean> identifiers = Map<>()
+        for ToolCall call : response.calls {
+          if call.callId.isBlank || identifiers.containsKey(key: call.callId) {
+            throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Duplicate or empty tool call identifier")
+          }
+          identifiers.put(key: call.callId, value: true)
+        }
+        for JsonValue item : response.output { history.add(item) }
+        for ToolCall call : response.calls {
+          callbacks.emit(event: GenerationEvent.ToolStarted(call: call))
+          String output = ""
+          Boolean succeeded = false
+          try { output = registry.invoke(call: call) succeeded = true }
+          catch Exception error {
+            callbacks.emit(event: GenerationEvent.ToolFailed(failure: ToolFailure(call: call, error: error)))
+            Map<String, JsonValue> failure = Map<>()
+            failure.put(key: "error", value: JsonValue.String(value: error.message))
+            output = writeJson(value: JsonValue.Object(fields: failure))
+          }
+          if succeeded { callbacks.emit(event: GenerationEvent.ToolCompleted(result: ToolResult(call: call, output: output))) }
+          Map<String, JsonValue> result = Map<>()
+          result.put(key: "type", value: JsonValue.String(value: "function_call_output"))
+          result.put(key: "call_id", value: JsonValue.String(value: call.callId))
+          result.put(key: "output", value: JsonValue.String(value: output))
+          history.add(JsonValue.Object(fields: result))
+        }
+      }
+      throw OpenAiException(code: "OPENAI-TOOL-LIMIT", message: "The run reached its model request limit")
+    } catch Exception error {
+      callbacks.emit(event: GenerationEvent.Failed(error: error))
+      throw error
+    }
+  }
+}

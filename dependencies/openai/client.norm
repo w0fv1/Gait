@@ -1,0 +1,789 @@
+package openai
+
+import std.core.Exception
+import std.json.jsonSchema
+import std.http.HttpClient
+import std.http.HttpRequest
+import std.http.HttpResponse
+import std.http.HttpMethod
+import std.http.HeaderMap
+import std.http.HttpHeader
+import std.http.Uri
+import std.http.systemHttpClient
+import std.io.use
+import std.io.readAll
+import std.io.encodeText
+import std.io.decodeText
+import std.io.TextEncoding
+import std.io.ReadChunk
+import std.io.Bytes
+import std.io.bytes
+import std.json.JsonValue
+import std.json.JsonException
+import std.json.parseJson
+import std.json.writeJson
+import std.json.fromJsonValue
+import std.json.fromJson
+import std.time.Duration
+import std.time.duration
+
+public enum ResponseStatus { Completed, Incomplete, Failed, Cancelled, Queued, InProgress }
+
+public class OpenAiException extends Exception {
+  String code
+  Integer? httpStatus
+  String? requestId
+
+  OpenAiException(String code, String message, Integer? httpStatus = null, String? requestId = null) {
+    super(message: message)
+    this.code = code
+    this.httpStatus = httpStatus
+    this.requestId = requestId
+  }
+}
+
+public enum StructuredOutputMode { JsonSchema, JsonObject }
+
+public value StructuredOutput {
+  String name
+  JsonValue schema
+  StructuredOutputMode mode = StructuredOutputMode.JsonSchema
+}
+
+public StructuredOutput structuredOutput<T>(String name = "result", StructuredOutputMode mode = StructuredOutputMode.JsonSchema) {
+  JsonValue schema = jsonSchema(type: T.class)
+  if mode == StructuredOutputMode.JsonSchema {
+    var root = WireObject(value: schema)
+    String? reference = root.optionalString(name: "$ref")
+    if reference != null {
+      var definitions = WireObject(value: root.required(name: "$defs"))
+      var definition = WireObject(value: definitions.required(name: reference.sliceCodePoints(start: 8, end: reference.codePointSize())))
+      definition.fields.put(key: "$defs", value: JsonValue.Object(fields: definitions.fields))
+      root = definition
+    }
+    if root.optionalString(name: "type") != "object" { throw OpenAiException(code: "OPENAI-INVALID-SCHEMA", message: "Structured output requires an object result type") }
+    schema = strictSchema(schema: JsonValue.Object(fields: root.fields))
+  }
+  return StructuredOutput(name: name, schema: schema, mode: mode)
+}
+
+private JsonValue strictSchema(JsonValue schema) {
+  var root = WireObject(value: schema)
+  if root.optionalString(name: "type") == "object" {
+    if root.fields.get(key: "additionalProperties") != JsonValue.Boolean(value: false) {
+      throw OpenAiException(code: "OPENAI-INVALID-SCHEMA", message: "Strict structured output cannot contain dynamic maps")
+    }
+    List<JsonValue> required = []
+    for Pair<String, JsonValue> property : WireObject(value: root.required(name: "properties")).fields {
+      required.add(JsonValue.String(value: property.first))
+    }
+    root.fields.put(key: "required", value: JsonValue.Array(values: required))
+  }
+  for String key : ["properties", "$defs"] {
+    JsonValue? value = root.fields.get(key: key)
+    if value != null {
+      Map<String, JsonValue> fields = Map<>()
+      for Pair<String, JsonValue> field : WireObject(value: value).fields { fields.put(key: field.first, value: strictSchema(schema: field.second)) }
+      root.fields.put(key: key, value: JsonValue.Object(fields: fields))
+    }
+  }
+  JsonValue? items = root.fields.get(key: "items")
+  if items != null { root.fields.put(key: "items", value: strictSchema(schema: items)) }
+  if root.fields.containsKey(key: "anyOf") {
+    List<JsonValue> choices = []
+    for JsonValue value : root.array(name: "anyOf") { choices.add(strictSchema(schema: value)) }
+    root.fields.put(key: "anyOf", value: JsonValue.Array(values: choices))
+  }
+  return JsonValue.Object(fields: root.fields)
+}
+
+public enum ResponseInput { Text(String value), Items(List<JsonValue> values) }
+
+public value ToolDefinition {
+  String name
+  String description
+  JsonValue parameters
+  Boolean strict = false
+}
+
+public value ToolCall {
+  String callId
+  String name
+  String arguments
+}
+
+public value ResponseRequest {
+  String model
+  ResponseInput input
+  String? instructions = null
+  StructuredOutput? format = null
+  Integer maximumOutputTokens = 1024
+  List<ToolDefinition> tools = []
+}
+
+public value Usage {
+  Long inputTokens
+  Long outputTokens
+  Long totalTokens
+}
+
+public value Response {
+  String id
+  ResponseStatus status
+  String text
+  String? refusal
+  String? incompleteReason
+  Usage? usage
+  String? errorCode
+  String? errorMessage
+  String? requestId
+  List<JsonValue> output
+  List<ToolCall> calls
+
+  public T decode<T>() {
+    if status != ResponseStatus.Completed || refusal != null {
+      throw OpenAiException(code: "OPENAI-NOT-COMPLETED", message: "Response has no completed structured output", requestId: requestId)
+    }
+    return fromJson<T>(value: text)
+  }
+}
+
+private value WireObject {
+  Map<String, JsonValue> fields
+
+  WireObject(JsonValue value) {
+    this.fields = switch value {
+      case Object(Map<String, JsonValue> fields) { break fields }
+      case _ { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Expected a JSON object") }
+    }
+  }
+
+  public JsonValue required(String name) {
+    JsonValue? value = fields.get(key: name)
+    if value == null { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Missing response field: " + name) }
+    return value
+  }
+
+  public String string(String name) {
+    return switch this.required(name: name) {
+      case String(String value) { break value }
+      case _ { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Expected string: " + name) }
+    }
+  }
+
+  public String? optionalString(String name) {
+    JsonValue value = fields.get(key: name) ?? JsonValue.Null
+    return switch value {
+      case Null { break null }
+      case String(String text) { break text }
+      case _ { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Expected optional string: " + name) }
+    }
+  }
+
+  public Message message() {
+    String text = ""
+    String? refusal = null
+    for JsonValue part : this.array(name: "content") {
+      var content = WireObject(value: part)
+      if content.string(name: "type") == "output_text" { text = text + content.string(name: "text") }
+      if content.string(name: "type") == "refusal" { refusal = (refusal ?? "") + content.string(name: "refusal") }
+    }
+    return Message(id: this.optionalString(name: "id") ?? "", text: text, refusal: refusal)
+  }
+
+  public List<JsonValue> array(String name) {
+    return switch this.required(name: name) {
+      case Array(List<JsonValue> values) { break values }
+      case _ { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Expected array: " + name) }
+    }
+  }
+}
+
+public class Client {
+  private String apiKey
+  private String model
+  private Uri endpoint
+  private HttpClient transport
+  private Duration timeout
+  private Integer maximumResponseBytes
+
+  Client(String apiKey, String model, String endpoint = "https://api.openai.com/v1/responses",
+    HttpClient transport = systemHttpClient(), Duration timeout = duration(seconds: 60, nanoseconds: 0),
+    Integer maximumResponseBytes = 1048576) {
+    if apiKey.isBlank || model.isBlank || maximumResponseBytes < 1 {
+      throw OpenAiException(code: "OPENAI-INVALID-CONFIGURATION", message: "A key and positive response budget are required")
+    }
+    this.apiKey = apiKey
+    this.model = model
+    this.endpoint = Uri(value: endpoint)
+    this.transport = transport
+    this.timeout = timeout
+    this.maximumResponseBytes = maximumResponseBytes
+  }
+
+  public String defaultModel() { return model }
+
+  public Response generate(String input, String? instructions = null, List<Function<?>> tools = [],
+    Integer maximumOutputTokens = 1024,
+    Function<Void(String)>? onResponseStarted = null,
+    Function<Void(String)>? onMessageStarted = null,
+    Function<Void(String)>? onText = null,
+    Function<Void(Message)>? onMessageCompleted = null,
+    Function<Void(ToolCall)>? onToolCallReceived = null,
+    Function<Void(Response)>? onResponseCompleted = null,
+    Function<Void(Exception)>? onFailed = null,
+    Function<Void(GenerationEvent)>? onEvent = null) {
+    var callbacks = GenerationCallbacks(onResponseStarted: onResponseStarted, onMessageStarted: onMessageStarted, onText: onText, onMessageCompleted: onMessageCompleted, onToolCallReceived: onToolCallReceived, onResponseCompleted: onResponseCompleted, onFailed: onFailed, onEvent: onEvent)
+    try {
+      var registry = ToolRegistry(tools: tools)
+      return this.exchange(request: ResponseRequest(model: model, input: ResponseInput.Text(value: input),
+        instructions: instructions, tools: registry.definitions(), maximumOutputTokens: maximumOutputTokens),
+        callbacks: callbacks)
+    } catch Exception error {
+      callbacks.emit(event: GenerationEvent.Failed(error: error))
+      throw error
+    }
+  }
+
+  public Response generate<T>(String input, String? instructions = null,
+    Integer maximumOutputTokens = 1024, StructuredOutputMode mode = StructuredOutputMode.JsonSchema, Function<Void(String)>? onResponseStarted = null,
+    Function<Void(String)>? onMessageStarted = null,
+    Function<Void(String)>? onText = null,
+    Function<Void(Message)>? onMessageCompleted = null,
+    Function<Void(ToolCall)>? onToolCallReceived = null,
+    Function<Void(Response)>? onResponseCompleted = null,
+    Function<Void(Exception)>? onFailed = null,
+    Function<Void(GenerationEvent)>? onEvent = null) {
+    var callbacks = GenerationCallbacks(onResponseStarted: onResponseStarted, onMessageStarted: onMessageStarted, onText: onText, onMessageCompleted: onMessageCompleted, onToolCallReceived: onToolCallReceived, onResponseCompleted: onResponseCompleted, onFailed: onFailed, onEvent: onEvent)
+    try {
+      return this.exchange(request: ResponseRequest(model: model, input: ResponseInput.Text(value: input),
+        instructions: instructions, maximumOutputTokens: maximumOutputTokens,
+        format: structuredOutput<T>(mode: mode)), callbacks: callbacks)
+    } catch Exception error {
+      callbacks.emit(event: GenerationEvent.Failed(error: error))
+      throw error
+    }
+  }
+
+  public Response exchange(ResponseRequest request, GenerationCallbacks callbacks = GenerationCallbacks(), Boolean stream = true) {
+    Function<Void(String)>? onText = null
+    if stream { onText = (String text) { callbacks.emit(event: GenerationEvent.Text(text: text)) } }
+    var response = this.send(request: request, onText: onText, events: callbacks)
+    if !stream {
+      callbacks.emit(event: GenerationEvent.ResponseStarted(id: response.id))
+      for JsonValue item : response.output {
+        var value = WireObject(value: item)
+        if value.optionalString(name: "type") == "message" {
+          var message = value.message()
+          callbacks.emit(event: GenerationEvent.MessageStarted(id: message.id))
+          callbacks.emit(event: GenerationEvent.MessageCompleted(message: message))
+        }
+      }
+    }
+    for ToolCall call : response.calls { callbacks.emit(event: GenerationEvent.ToolCallReceived(call: call)) }
+    callbacks.emit(event: GenerationEvent.ResponseCompleted(response: response))
+    return response
+  }
+
+  private Response send(ResponseRequest request, Function<Void(String)>? onText = null, GenerationCallbacks? events = null) {
+    if request.model.isBlank || request.maximumOutputTokens < 1 {
+      throw OpenAiException(code: "OPENAI-INVALID-REQUEST", message: "A model and positive token budget are required")
+    }
+    Map<String, JsonValue> payload = Map<>()
+    payload.put(key: "model", value: JsonValue.String(value: request.model))
+    payload.put(key: "input", value: switch request.input {
+      case Text(String value) { break JsonValue.String(value: value) }
+      case Items(List<JsonValue> values) { break JsonValue.Array(values: values) }
+    })
+    if request.tools.size() > 0 {
+      List<JsonValue> tools = []
+      for ToolDefinition tool : request.tools {
+        Map<String, JsonValue> fields = Map<>()
+        fields.put(key: "type", value: JsonValue.String(value: "function"))
+        fields.put(key: "name", value: JsonValue.String(value: tool.name))
+        fields.put(key: "description", value: JsonValue.String(value: tool.description))
+        fields.put(key: "parameters", value: tool.parameters)
+        fields.put(key: "strict", value: JsonValue.Boolean(value: tool.strict))
+        tools.add(JsonValue.Object(fields: fields))
+      }
+      payload.put(key: "tools", value: JsonValue.Array(values: tools))
+      payload.put(key: "parallel_tool_calls", value: JsonValue.Boolean(value: false))
+    }
+    payload.put(key: "store", value: JsonValue.Boolean(value: false))
+    if onText != null { payload.put(key: "stream", value: JsonValue.Boolean(value: true)) }
+    payload.put(key: "max_output_tokens", value: JsonValue.Number(value: request.maximumOutputTokens.toString()))
+    String? instructions = request.instructions
+    if instructions != null { payload.put(key: "instructions", value: JsonValue.String(value: instructions)) }
+    StructuredOutput? format = request.format
+    if format != null {
+      if format.name.isBlank { throw OpenAiException(code: "OPENAI-INVALID-REQUEST", message: "Structured output needs a name") }
+      Map<String, JsonValue> definition = Map<>()
+      if format.mode == StructuredOutputMode.JsonObject {
+        definition.put(key: "type", value: JsonValue.String(value: "json_object"))
+        payload.put(key: "instructions", value: JsonValue.String(value: (instructions ?? "") + "\nReturn only a JSON object matching JSON schema " + format.name + ": " + writeJson(value: format.schema)))
+      } else {
+        definition.put(key: "type", value: JsonValue.String(value: "json_schema"))
+        definition.put(key: "name", value: JsonValue.String(value: format.name))
+        definition.put(key: "schema", value: format.schema)
+        definition.put(key: "strict", value: JsonValue.Boolean(value: true))
+      }
+      Map<String, JsonValue> text = Map<>()
+      text.put(key: "format", value: JsonValue.Object(fields: definition))
+      payload.put(key: "text", value: JsonValue.Object(fields: text))
+    }
+    Boolean chat = endpoint.value.endsWith(suffix: "/chat/completions")
+    if chat { payload = chatPayload(payload: payload) }
+    HttpRequest outgoing = HttpRequest(method: HttpMethod.Post, uri: endpoint,
+      headers: HeaderMap(values: [HttpHeader(name: "Authorization", value: "Bearer " + apiKey), HttpHeader(name: "Content-Type", value: "application/json")]),
+      body: encodeText(text: writeJson(value: JsonValue.Object(fields: payload)), encoding: TextEncoding.Utf8))
+    HttpResponse incoming = transport.send(request: outgoing, timeout: timeout)
+    return use<Response>(resource: incoming, body: () {
+      Integer status = incoming.status().code
+      String? requestId = null
+      for HttpHeader header : incoming.headers().values {
+        if header.name.equalsIgnoreCaseAscii(other: "x-request-id") { requestId = header.value }
+      }
+      JsonValue document = JsonValue.Null
+      if onText != null && status >= 200 && status < 300 {
+        Boolean eventStream = false
+        for HttpHeader header : incoming.headers().values {
+          if header.name.equalsIgnoreCaseAscii(other: "content-type") && header.value.split(separator: ";")[0].trim().equalsIgnoreCaseAscii(other: "text/event-stream") { eventStream = true }
+        }
+        if !eventStream { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Expected text/event-stream for streaming response") }
+        if chat {
+          ChatStream stream = ChatStream(onText: onText, events: events)
+          readEventStream(incoming: incoming, onEvent: (String data) { return stream.accept(data: data) }, maximumBytes: maximumResponseBytes)
+          document = stream.document()
+        } else {
+          ResponseStream stream = ResponseStream(onText: onText, events: events)
+          readEventStream(incoming: incoming, onEvent: (String data) { return stream.accept(data: data) }, maximumBytes: maximumResponseBytes)
+          document = stream.document
+        }
+      } else {
+        document = responseJson(value: decodeText(content: readAll(reader: incoming, maximumBytes: maximumResponseBytes), encoding: TextEncoding.Utf8), httpStatus: status, requestId: requestId)
+      }
+      try {
+        WireObject root = WireObject(value: document)
+        if status < 200 || status >= 300 {
+          WireObject error = WireObject(value: root.required(name: "error"))
+          throw OpenAiException(code: error.optionalString(name: "code") ?? "OPENAI-HTTP", message: error.string(name: "message"), httpStatus: status, requestId: requestId)
+        }
+        if chat { root = WireObject(value: chatResponse(root: root)) }
+        ResponseStatus state = switch root.string(name: "status") {
+          case "completed" { break ResponseStatus.Completed }
+          case "incomplete" { break ResponseStatus.Incomplete }
+          case "failed" { break ResponseStatus.Failed }
+          case "cancelled" { break ResponseStatus.Cancelled }
+          case "queued" { break ResponseStatus.Queued }
+          case "in_progress" { break ResponseStatus.InProgress }
+          case _ { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Unknown response status") }
+        }
+        String text = ""
+        String? refusal = null
+        List<ToolCall> calls = []
+        List<JsonValue> outputs = root.array(name: "output")
+        for JsonValue output : outputs {
+          WireObject item = WireObject(value: output)
+          if item.string(name: "type") == "function_call" {
+            calls.add(ToolCall(callId: item.string(name: "call_id"), name: item.string(name: "name"), arguments: item.string(name: "arguments")))
+          } else if item.string(name: "type") == "message" {
+            for JsonValue part : item.array(name: "content") {
+              WireObject content = WireObject(value: part)
+              String kind = content.string(name: "type")
+              if kind == "output_text" { text = text + content.string(name: "text") }
+              else if kind == "refusal" { refusal = (refusal ?? "") + content.string(name: "refusal") }
+            }
+          }
+        }
+        Usage? usage = null
+        JsonValue rawUsage = root.fields.get(key: "usage") ?? JsonValue.Null
+        if rawUsage != JsonValue.Null {
+          WireObject tokens = WireObject(value: rawUsage)
+          usage = Usage(inputTokens: fromJsonValue<Long>(value: tokens.required(name: "input_tokens")),
+            outputTokens: fromJsonValue<Long>(value: tokens.required(name: "output_tokens")),
+            totalTokens: fromJsonValue<Long>(value: tokens.required(name: "total_tokens")))
+        }
+        String? incomplete = null
+        JsonValue details = root.fields.get(key: "incomplete_details") ?? JsonValue.Null
+        if details != JsonValue.Null { incomplete = WireObject(value: details).string(name: "reason") }
+        String? errorCode = null
+        String? errorMessage = null
+        JsonValue failure = root.fields.get(key: "error") ?? JsonValue.Null
+        if failure != JsonValue.Null {
+          WireObject error = WireObject(value: failure)
+          errorCode = error.string(name: "code")
+          errorMessage = error.string(name: "message")
+        }
+        return Response(id: root.string(name: "id"), status: state, text: text, refusal: refusal,
+          incompleteReason: incomplete, usage: usage, errorCode: errorCode, errorMessage: errorMessage, requestId: requestId, output: outputs, calls: calls)
+      } catch JsonException error {
+        throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Invalid response JSON", httpStatus: status, requestId: requestId)
+      } catch OpenAiException error {
+        throw OpenAiException(code: error.code, message: error.message, httpStatus: status, requestId: requestId)
+      }
+    })
+  }
+}
+
+private JsonValue responseJson(String value, Integer? httpStatus = null, String? requestId = null) {
+  try { return parseJson(value: value) }
+  catch JsonException error { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Invalid response JSON", httpStatus: httpStatus, requestId: requestId) }
+}
+
+private class ResponseStream {
+  private Function<Void(String)> onText
+  public JsonValue document = JsonValue.Null
+
+  private GenerationCallbacks? events = null
+
+  ResponseStream(Function<Void(String)> onText, GenerationCallbacks? events) { this.onText = onText this.events = events }
+
+  public Boolean accept(String data) {
+    if data.trim() == "[DONE]" { throw OpenAiException(code: "OPENAI-STREAM-INCOMPLETE", message: "Stream ended without a terminal response") }
+    WireObject event = WireObject(value: responseJson(value: data))
+    String kind = event.string(name: "type")
+    var callbacks = events
+    if callbacks != null {
+      if kind == "response.created" {
+        callbacks.emit(event: GenerationEvent.ResponseStarted(id: WireObject(value: event.required(name: "response")).string(name: "id")))
+      } else if kind == "response.output_item.added" || kind == "response.output_item.done" {
+        var item = WireObject(value: event.required(name: "item"))
+        if item.string(name: "type") == "message" {
+          String id = item.string(name: "id")
+          if kind == "response.output_item.added" { callbacks.emit(event: GenerationEvent.MessageStarted(id: id)) }
+          else {
+            callbacks.emit(event: GenerationEvent.MessageCompleted(message: item.message()))
+          }
+        }
+      }
+    }
+    if kind == "response.output_text.delta" || kind == "response.refusal.delta" {
+      onText(event.string(name: "delta"))
+    } else if kind == "response.completed" || kind == "response.failed" || kind == "response.incomplete" {
+      document = event.required(name: "response")
+      return true
+    } else if kind == "error" {
+      throw OpenAiException(code: event.optionalString(name: "code") ?? "OPENAI-STREAM-ERROR", message: event.string(name: "message"))
+    }
+    return false
+  }
+}
+
+private value ChatCall {
+  String id = ""
+  String name = ""
+  String arguments = ""
+
+  public JsonValue json() {
+    Map<String, JsonValue> functionFields = Map<>()
+    functionFields.put(key: "name", value: JsonValue.String(value: name))
+    functionFields.put(key: "arguments", value: JsonValue.String(value: arguments))
+    Map<String, JsonValue> fields = Map<>()
+    fields.put(key: "id", value: JsonValue.String(value: id))
+    fields.put(key: "type", value: JsonValue.String(value: "function"))
+    fields.put(key: "function", value: JsonValue.Object(fields: functionFields))
+    return JsonValue.Object(fields: fields)
+  }
+}
+
+private class ChatStream {
+  private Function<Void(String)> onText
+  private String id = ""
+  private String text = ""
+  private String reasoning = ""
+  private String refusal = ""
+  private String? finish = null
+  private Map<Integer, ChatCall> calls = Map<>()
+
+  private GenerationCallbacks? events = null
+  private Boolean started = false
+  private Boolean messageStarted = false
+
+  ChatStream(Function<Void(String)> onText, GenerationCallbacks? events) { this.onText = onText this.events = events }
+
+  public Boolean accept(String data) {
+    if data.trim() == "[DONE]" {
+      if finish == null { throw OpenAiException(code: "OPENAI-STREAM-INCOMPLETE", message: "Stream ended without finish_reason") }
+      return true
+    }
+    WireObject chunk = WireObject(value: responseJson(value: data))
+    JsonValue error = chunk.fields.get(key: "error") ?? JsonValue.Null
+    if error != JsonValue.Null { throw OpenAiException(code: "OPENAI-STREAM-ERROR", message: WireObject(value: error).string(name: "message")) }
+    id = chunk.string(name: "id")
+    var callbacks = events
+    if !started { started = true if callbacks != null { callbacks.emit(event: GenerationEvent.ResponseStarted(id: id)) } }
+    for JsonValue value : chunk.array(name: "choices") {
+      WireObject choice = WireObject(value: value)
+      if fromJsonValue<Integer>(value: choice.required(name: "index")) != 0 { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Expected a single completion choice") }
+      if finish != null { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Completion data after finish_reason") }
+      WireObject delta = WireObject(value: choice.required(name: "delta"))
+      String content = delta.optionalString(name: "content") ?? ""
+      String rejected = delta.optionalString(name: "refusal") ?? ""
+      if !messageStarted && (delta.fields.containsKey(key: "content") || delta.fields.containsKey(key: "refusal")) {
+        messageStarted = true
+        if callbacks != null { callbacks.emit(event: GenerationEvent.MessageStarted(id: id)) }
+      }
+      text = text + content
+      refusal = refusal + rejected
+      reasoning = reasoning + (delta.optionalString(name: "reasoning_content") ?? "")
+      if !content.isEmpty() { onText(content) }
+      if !rejected.isEmpty() { onText(rejected) }
+      JsonValue rawCalls = delta.fields.get(key: "tool_calls") ?? JsonValue.Null
+      if rawCalls != JsonValue.Null {
+        for JsonValue rawCall : delta.array(name: "tool_calls") {
+          WireObject item = WireObject(value: rawCall)
+          Integer index = fromJsonValue<Integer>(value: item.required(name: "index"))
+          if index < 0 || index > calls.size() { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Invalid tool call index") }
+          ChatCall previous = calls.get(key: index) ?? ChatCall()
+          WireObject definition = WireObject(value: item.required(name: "function"))
+          calls.put(key: index, value: ChatCall(id: previous.id + (item.optionalString(name: "id") ?? ""),
+            name: previous.name + (definition.optionalString(name: "name") ?? ""),
+            arguments: previous.arguments + (definition.optionalString(name: "arguments") ?? "")))
+        }
+      }
+      finish = choice.optionalString(name: "finish_reason")
+      if finish != null && messageStarted && callbacks != null {
+        callbacks.emit(event: GenerationEvent.MessageCompleted(message: Message(id: id, text: text, refusal: if refusal.isEmpty() { null } else { refusal })))
+      }
+    }
+    return false
+  }
+
+  public JsonValue document() {
+    Map<String, JsonValue> message = Map<>()
+    message.put(key: "content", value: JsonValue.String(value: text))
+    message.put(key: "reasoning_content", value: JsonValue.String(value: reasoning))
+    if !refusal.isEmpty() { message.put(key: "refusal", value: JsonValue.String(value: refusal)) }
+    List<JsonValue> tools = []
+    for Integer index : range(start: 0, end: calls.size()) {
+      ChatCall? call = calls.get(key: index)
+      if call == null { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Missing tool call index") }
+      tools.add(call.json())
+    }
+    if tools.size() > 0 { message.put(key: "tool_calls", value: JsonValue.Array(values: tools)) }
+    Map<String, JsonValue> choice = Map<>()
+    choice.put(key: "message", value: JsonValue.Object(fields: message))
+    choice.put(key: "finish_reason", value: JsonValue.String(value: finish ?? ""))
+    Map<String, JsonValue> root = Map<>()
+    root.put(key: "id", value: JsonValue.String(value: id))
+    root.put(key: "choices", value: JsonValue.Array(values: [JsonValue.Object(fields: choice)]))
+    return JsonValue.Object(fields: root)
+  }
+}
+
+private Map<String, JsonValue> chatPayload(Map<String, JsonValue> payload) {
+  WireObject source = WireObject(value: JsonValue.Object(fields: payload))
+  Map<String, JsonValue> result = Map<>()
+  result.put(key: "model", value: source.required(name: "model"))
+  result.put(key: "max_completion_tokens", value: source.required(name: "max_output_tokens"))
+  JsonValue? stream = payload.get(key: "stream")
+  if stream != null { result.put(key: "stream", value: stream) }
+  List<JsonValue> messages = []
+  String? instructions = source.optionalString(name: "instructions")
+  if instructions != null {
+    Map<String, JsonValue> system = Map<>()
+    system.put(key: "role", value: JsonValue.String(value: "system"))
+    system.put(key: "content", value: JsonValue.String(value: instructions))
+    messages.add(JsonValue.Object(fields: system))
+  }
+  List<JsonValue> items = switch source.required(name: "input") {
+    case String(String text) {
+      Map<String, JsonValue> user = Map<>()
+      user.put(key: "role", value: JsonValue.String(value: "user"))
+      user.put(key: "content", value: JsonValue.String(value: text))
+      break [JsonValue.Object(fields: user)]
+    }
+    case Array(List<JsonValue> values) { break values }
+    case _ { throw OpenAiException(code: "OPENAI-INVALID-REQUEST", message: "Invalid completion input") }
+  }
+  Map<String, JsonValue>? assistant = null
+  List<JsonValue> calls = []
+  for JsonValue value : items {
+    WireObject item = WireObject(value: value)
+    String kind = item.optionalString(name: "type") ?? "message"
+    if kind == "function_call" {
+      if assistant == null {
+        Map<String, JsonValue> empty = Map<>()
+        empty.put(key: "role", value: JsonValue.String(value: "assistant"))
+        empty.put(key: "content", value: JsonValue.Null)
+        assistant = empty
+      }
+      calls.add(ChatCall(id: item.string(name: "call_id"), name: item.string(name: "name"), arguments: item.string(name: "arguments")).json())
+    } else {
+      if assistant != null {
+        if calls.size() > 0 { assistant.put(key: "tool_calls", value: JsonValue.Array(values: calls)) }
+        messages.add(JsonValue.Object(fields: assistant))
+        assistant = null
+        calls = []
+      }
+      Map<String, JsonValue> message = Map<>()
+      if kind == "function_call_output" {
+        message.put(key: "role", value: JsonValue.String(value: "tool"))
+        message.put(key: "tool_call_id", value: item.required(name: "call_id"))
+        message.put(key: "content", value: item.required(name: "output"))
+        messages.add(JsonValue.Object(fields: message))
+      } else if kind == "message" {
+        String role = item.string(name: "role")
+        message.put(key: "role", value: JsonValue.String(value: role))
+        JsonValue content = item.required(name: "content")
+        String text = switch content {
+          case String(String text) { break text }
+          case Array(List<JsonValue> parts) {
+            String text = ""
+            for JsonValue part : parts {
+              WireObject field = WireObject(value: part)
+              String type = field.string(name: "type")
+              if type != "output_text" && type != "input_text" { throw OpenAiException(code: "OPENAI-INVALID-REQUEST", message: "Unsupported completion content") }
+              text = text + field.string(name: "text")
+            }
+            break text
+          }
+          case _ { throw OpenAiException(code: "OPENAI-INVALID-REQUEST", message: "Unsupported completion content") }
+        }
+        message.put(key: "content", value: JsonValue.String(value: text))
+        String? reasoning = item.optionalString(name: "reasoning_content")
+        if reasoning != null { message.put(key: "reasoning_content", value: JsonValue.String(value: reasoning)) }
+        if role == "assistant" { assistant = message }
+        else { messages.add(JsonValue.Object(fields: message)) }
+      } else { throw OpenAiException(code: "OPENAI-INVALID-REQUEST", message: "Unsupported completion input item") }
+    }
+  }
+  if assistant != null {
+    if calls.size() > 0 { assistant.put(key: "tool_calls", value: JsonValue.Array(values: calls)) }
+    messages.add(JsonValue.Object(fields: assistant))
+  }
+  result.put(key: "messages", value: JsonValue.Array(values: messages))
+  if payload.containsKey(key: "tools") {
+    List<JsonValue> tools = []
+    for JsonValue value : source.array(name: "tools") {
+      WireObject item = WireObject(value: value)
+      Map<String, JsonValue> definition = Map<>()
+      for Pair<String, JsonValue> field : item.fields { if field.first != "type" { definition.put(key: field.first, value: field.second) } }
+      Map<String, JsonValue> tool = Map<>()
+      tool.put(key: "type", value: JsonValue.String(value: "function"))
+      tool.put(key: "function", value: JsonValue.Object(fields: definition))
+      tools.add(JsonValue.Object(fields: tool))
+    }
+    result.put(key: "tools", value: JsonValue.Array(values: tools))
+    result.put(key: "parallel_tool_calls", value: JsonValue.Boolean(value: false))
+  }
+  JsonValue? text = payload.get(key: "text")
+  if text != null {
+    WireObject format = WireObject(value: WireObject(value: text).required(name: "format"))
+    if format.string(name: "type") == "json_object" { result.put(key: "response_format", value: JsonValue.Object(fields: format.fields)) }
+    else {
+      Map<String, JsonValue> schema = Map<>()
+      for Pair<String, JsonValue> field : format.fields { if field.first != "type" { schema.put(key: field.first, value: field.second) } }
+      Map<String, JsonValue> wrapper = Map<>()
+      wrapper.put(key: "type", value: JsonValue.String(value: "json_schema"))
+      wrapper.put(key: "json_schema", value: JsonValue.Object(fields: schema))
+      result.put(key: "response_format", value: JsonValue.Object(fields: wrapper))
+    }
+  }
+  return result
+}
+
+private JsonValue chatResponse(WireObject root) {
+  List<JsonValue> choices = root.array(name: "choices")
+  if choices.size() != 1 { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Expected a single completion choice") }
+  WireObject choice = WireObject(value: choices[0])
+  String finish = choice.string(name: "finish_reason")
+  if finish != "stop" && finish != "tool_calls" && finish != "length" && finish != "content_filter" { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Unsupported completion finish reason") }
+  WireObject message = WireObject(value: choice.required(name: "message"))
+  List<JsonValue> output = []
+  Map<String, JsonValue> assistant = Map<>()
+  assistant.put(key: "type", value: JsonValue.String(value: "message"))
+  assistant.put(key: "role", value: JsonValue.String(value: "assistant"))
+  Map<String, JsonValue> text = Map<>()
+  text.put(key: "type", value: JsonValue.String(value: "output_text"))
+  text.put(key: "text", value: JsonValue.String(value: message.optionalString(name: "content") ?? ""))
+  List<JsonValue> content = [JsonValue.Object(fields: text)]
+  String? refusal = message.optionalString(name: "refusal")
+  if refusal != null {
+    Map<String, JsonValue> rejected = Map<>()
+    rejected.put(key: "type", value: JsonValue.String(value: "refusal"))
+    rejected.put(key: "refusal", value: JsonValue.String(value: refusal))
+    content.add(JsonValue.Object(fields: rejected))
+  }
+  assistant.put(key: "content", value: JsonValue.Array(values: content))
+  String? reasoning = message.optionalString(name: "reasoning_content")
+  if reasoning != null { assistant.put(key: "reasoning_content", value: JsonValue.String(value: reasoning)) }
+  output.add(JsonValue.Object(fields: assistant))
+  JsonValue rawCalls = message.fields.get(key: "tool_calls") ?? JsonValue.Null
+  if rawCalls != JsonValue.Null {
+    for JsonValue value : message.array(name: "tool_calls") {
+      WireObject call = WireObject(value: value)
+      if call.string(name: "type") != "function" { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Unsupported completion tool type") }
+      WireObject definition = WireObject(value: call.required(name: "function"))
+      Map<String, JsonValue> fields = Map<>()
+      fields.put(key: "type", value: JsonValue.String(value: "function_call"))
+      fields.put(key: "call_id", value: call.required(name: "id"))
+      fields.put(key: "name", value: definition.required(name: "name"))
+      fields.put(key: "arguments", value: definition.required(name: "arguments"))
+      output.add(JsonValue.Object(fields: fields))
+    }
+  }
+  if ((finish == "tool_calls" && output.size() == 1) || (finish == "stop" && output.size() > 1)) { throw OpenAiException(code: "OPENAI-PROTOCOL", message: "Tool calls do not match finish_reason") }
+  Map<String, JsonValue> result = Map<>()
+  result.put(key: "id", value: root.required(name: "id"))
+  result.put(key: "status", value: JsonValue.String(value: if finish == "stop" || finish == "tool_calls" { "completed" } else { "incomplete" }))
+  result.put(key: "output", value: JsonValue.Array(values: output))
+  JsonValue usage = root.fields.get(key: "usage") ?? JsonValue.Null
+  if usage != JsonValue.Null {
+    WireObject tokens = WireObject(value: usage)
+    Map<String, JsonValue> counts = Map<>()
+    counts.put(key: "input_tokens", value: tokens.required(name: "prompt_tokens"))
+    counts.put(key: "output_tokens", value: tokens.required(name: "completion_tokens"))
+    counts.put(key: "total_tokens", value: tokens.required(name: "total_tokens"))
+    result.put(key: "usage", value: JsonValue.Object(fields: counts))
+  }
+  return JsonValue.Object(fields: result)
+}
+
+private Void readEventStream(HttpResponse incoming, Function<Boolean(String)> onEvent, Integer maximumBytes) {
+  Array<Integer> lineBytes = Array.filled(size: maximumBytes, value: 0)
+  Integer length = 0
+  Integer consumed = 0
+  Boolean carriageReturn = false
+  Boolean firstLine = true
+  String data = ""
+  Boolean ended = false
+  for !ended {
+    switch incoming.read(maximumBytes: 8192) {
+      case Eof { ended = true }
+      case Data(Bytes chunk) {
+        consumed = consumed + chunk.size()
+        if consumed > maximumBytes { throw OpenAiException(code: "OPENAI-STREAM-LIMIT", message: "Streaming response exceeded byte budget") }
+        for Integer index : range(start: 0, end: chunk.size()) {
+          Integer value = chunk.at(index: index)
+          if value == 10 && carriageReturn {
+            carriageReturn = false
+          } else if value == 10 || value == 13 {
+            carriageReturn = value == 13
+            Array<Integer> content = Array.filled(size: length, value: 0)
+            for Integer offset : range(start: 0, end: length) { content[offset] = lineBytes[offset] }
+            String line = decodeText(content: bytes(values: content), encoding: TextEncoding.Utf8)
+            length = 0
+            if firstLine && line.startsWith(prefix: "﻿") { line = line.sliceCodePoints(start: 1, end: line.codePointSize()) }
+            firstLine = false
+            if line.isEmpty() {
+              if !data.isEmpty() {
+                if onEvent(data) { return }
+                data = ""
+              }
+            } else if line.startsWith(prefix: "data:") {
+              String part = line.sliceCodePoints(start: 5, end: line.codePointSize())
+              if part.startsWith(prefix: " ") { part = part.sliceCodePoints(start: 1, end: part.codePointSize()) }
+              data = data + part + "\n"
+            }
+          } else {
+            carriageReturn = false
+            lineBytes[length] = value
+            length = length + 1
+          }
+        }
+      }
+    }
+  }
+  throw OpenAiException(code: "OPENAI-STREAM-INCOMPLETE", message: "Connection closed before a terminal response event")
+}

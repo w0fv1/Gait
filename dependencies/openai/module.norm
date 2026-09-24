@@ -1,0 +1,3 @@
+Module module() {
+  return module(name: "openai", version: 1, exports: ["client", "tools", "events", "agent"])
+}
