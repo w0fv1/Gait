@@ -8,10 +8,15 @@ import tempfile
 import threading
 import unittest
 
-from scripts.toolchain import gait_command, prepare
-
-
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def gait_command():
+    name = 'gait.exe' if os.name == 'nt' else 'gait'
+    executable = Path(os.environ.get('GAIT_EXECUTABLE', ROOT / 'gait' / 'build' / name)).resolve()
+    if not executable.is_file():
+        raise RuntimeError(f'Build Gait before running integration tests: {executable}')
+    return [str(executable)]
 
 
 @contextmanager
@@ -51,10 +56,8 @@ def probe_server(probe_ok=True, probe_status=200, probe_error=None):
 class GaitFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if os.environ.get('GAIT_EXECUTABLE'):
-            (ROOT / '.tmp').mkdir(exist_ok=True)
-        else:
-            prepare()
+        (ROOT / '.tmp').mkdir(exist_ok=True)
+        gait_command()
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(dir=ROOT / '.tmp')

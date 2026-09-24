@@ -10,7 +10,7 @@ Gait 的编译命令是 `norm build gait`，在仓库根目录运行；首次本
 norm build gait
 ```
 
-产物位于 `gait/build/gait.exe`（Windows）；其他系统为 `gait/build/gait`。本仓库已包含所需的 OpenAI Norm 模块源码，不再需要额外复制这个依赖。Norm 发布兼容安装版后，Gait 的构建将只需安装该 CLI 并运行上面的 `norm build`。
+产物位于 `gait/build/gait.exe`（Windows）；其他系统为 `gait/build/gait`。OpenAI 模块由 Norm 包管理器从 [normlanguage/openai](https://github.com/normlanguage/openai/releases/tag/v1) 解析。Norm 发布兼容安装版后，Gait 的构建将只需安装该 CLI 并运行上面的 `norm build`。
 
 ```powershell
 .\gait\build\gait.exe 回复ok
@@ -67,15 +67,13 @@ Git 工具通过参数数组执行，保留路径、冲突与写后验证。模�
 
 运行产物为 `gait/build/gait.exe`，需要 PATH 中的 Git 来执行 Git 工具。应用不依赖 Python 或 Java。
 
-直接修改源码后运行 `norm build gait` 即可重新编译。开发脚本需要 Python 和兼容的 Norm CLI（通过 PATH 或 `NORM_CLI` 指定），可用于运行源码、校验依赖指纹并把构建产物复制到 `dist/`：
+直接修改源码后运行 `norm build gait` 即可重新编译。Norm 单元测试使用同一 CLI：
 
 ```text
-python scripts/manage.py prepare
-python scripts/manage.py run -- 回复ok
-python scripts/manage.py build
+norm test gait
 ```
 
-所附 OpenAI 模块的依赖指纹见 [dependencies.lock.json](dependencies.lock.json)。请求、工具和初始化验收见 [tests](tests)，结构见 [docs/architecture.md](docs/architecture.md)。
+模拟 API、Git 操作和 Windows 控制台的进程级验收使用 Python，测试代码见 [tests](tests)，结构见 [docs/architecture.md](docs/architecture.md)。
 
 构建后可运行测试：
 
@@ -87,4 +85,4 @@ python -m unittest discover -s tests -v
 
 ## 许可证与贡献
 
-Gait 源码以 [MPL-2.0](LICENSE) 发布。`dependencies/openai/` 包含来自 [Norm](https://github.com/normlanguage/Norm/tree/main/norm/libraries/openai) 的 OpenAI 模块源码，其来源和许可证见 [SOURCE.md](dependencies/openai/SOURCE.md)。构建时使用的 Norm 工具链仍受 [Norm 的许可证与第三方声明](https://github.com/normlanguage/Norm/blob/main/LICENSING.md) 约束。贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+Gait 源码以 [MPL-2.0](LICENSE) 发布。OpenAI 模块是独立的 [Norm 包](https://github.com/normlanguage/openai)，遵循其自身许可证。Norm 工具链受 [Norm 的许可证与第三方声明](https://github.com/normlanguage/Norm/blob/main/LICENSING.md) 约束。贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。

@@ -1,0 +1,11 @@
+package gait.test.config
+
+import gait.responsesEndpoint
+import std.testing.Test
+
+@Test(functions: [responsesEndpoint.function])
+Void responseEndpointNormalization() {
+  require(condition: responsesEndpoint(address: " https://example.com/v1/ ") == "https://example.com/v1/responses", message: "base URL")
+  require(condition: responsesEndpoint(address: "https://example.com/v1/chat/completions") == "https://example.com/v1/chat/completions", message: "Chat Completions URL")
+  require(condition: responsesEndpoint(address: "https://example.com/v1/responses") == "https://example.com/v1/responses", message: "Responses URL")
+}

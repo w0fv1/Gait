@@ -2,8 +2,7 @@ import json
 import os
 import subprocess
 
-from scripts.toolchain import gait_command
-from tests.support import GaitFixture, probe_server
+from tests.support import GaitFixture, gait_command, probe_server
 
 
 class Initialization(GaitFixture):

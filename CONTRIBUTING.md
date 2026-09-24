@@ -4,16 +4,16 @@
 
 ## 开发环境
 
-需要 Git、Python 和兼容的 [Norm](https://github.com/normlanguage/Norm) CLI。当前公开的 Norm `v0.24.0` 尚不兼容；已用 Norm 源码提交 `6c3e1c5` 构建的 CLI 验证。在兼容的 Norm 安装版发布前，需按 Norm 自身说明从该源码构建 CLI，并将其放到 PATH，或用 `NORM_CLI` 指定给开发脚本。OpenAI 模块源码已在 `dependencies/openai/` 中。在本仓库执行：
+需要 Git、Python 和兼容的 [Norm](https://github.com/normlanguage/Norm) CLI。当前公开的 Norm `v0.24.0` 尚不兼容；已用 Norm 源码提交 `6c3e1c5` 构建的 CLI 验证。在兼容的 Norm 安装版发布前，需按 Norm 自身说明从该源码构建 CLI。在本仓库执行：
 
 ```powershell
-python scripts/manage.py prepare
 norm build gait
+norm test gait
 $env:GAIT_EXECUTABLE = (Resolve-Path .\gait\build\gait.exe).Path
 python -m unittest discover -s tests -v
 ```
 
-如需运行 Windows 控制台相关测试，先安装 `python -m pip install -r tests/requirements-windows.txt`。测试使用本地模拟接口，不需要真实 API 密钥。`python scripts/manage.py build` 可作为可选命令，把编译产物复制到 `dist/`。
+如需运行 Windows 控制台相关测试，先安装 `python -m pip install -r tests/requirements-windows.txt`。Python 测试使用本地模拟接口，不需要真实 API 密钥。
 
 ## 提交改动
 

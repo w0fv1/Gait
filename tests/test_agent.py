@@ -5,8 +5,7 @@ import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from scripts.toolchain import gait_command
-from tests.support import GaitFixture
+from tests.support import GaitFixture, gait_command
 
 
 def reply(text):
