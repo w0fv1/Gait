@@ -1,6 +1,10 @@
-# gait
+# Gait
 
 使用 Norm 实现的通用 Agent，模型直接回答，并按需调用 Git 工具。
+
+## 获取与构建
+
+从 [GitHub 仓库](https://github.com/w0fv1/Gait) 克隆源码。当前尚未发布预编译版本；下文的 `dist/gait.exe` 需要先按[开发](#开发)一节构建。构建需要 [Norm](https://github.com/normlanguage/Norm) 源码、Python 和 JDK 25。将 Norm 放在 Gait 同级目录，或通过 `NORM_HOME` 指定路径。`prepare` 会核对 `dependencies.lock.json` 中的依赖指纹，避免使用不匹配的 Norm 源码。
 
 ```powershell
 .\dist\gait.exe 回复ok
@@ -57,7 +61,7 @@ Git 工具通过参数数组执行，保留路径、冲突与写后验证。模�
 
 运行产物为 `dist/gait.exe`，需要 PATH 中的 Git 来执行 Git 工具。应用不依赖 Python 或 Java。
 
-源码开发需要 Python、Java 25 和同级 Norm 工作区，可用 `NORM_HOME` 指定 Norm 目录。先在 Norm 中构建 `:compiler:installDist :compiler:generateRuntimeLaunchers`，再执行：
+源码开发需要 Python、JDK 25 和同级 Norm 工作区，可用 `NORM_HOME` 指定 Norm 目录。先在 Norm 目录用 Maven wrapper 构建运行时（Windows：`.\mvnw.cmd -DskipTests package`；其他系统：`./mvnw -DskipTests package`），再执行：
 
 ```text
 python scripts/manage.py prepare
@@ -66,3 +70,14 @@ python scripts/manage.py build
 ```
 
 依赖指纹见 [dependencies.lock.json](dependencies.lock.json)。请求、工具和初始化验收见 [tests](tests)，结构见 [docs/architecture.md](docs/architecture.md)。
+
+构建后可运行测试：
+
+```powershell
+$env:GAIT_EXECUTABLE = (Resolve-Path .\dist\gait.exe).Path
+python -m unittest discover -s tests -v
+```
+
+## 许可证与贡献
+
+Gait 源码以 [MPL-2.0](LICENSE) 发布。构建时使用的 Norm 源码及运行时仍受 [Norm 的许可证与第三方声明](https://github.com/normlanguage/Norm/blob/main/LICENSING.md) 约束；本仓库不会提交复制到 `dependencies/` 的 Norm 源码。贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。

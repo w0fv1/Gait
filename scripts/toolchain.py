@@ -35,11 +35,10 @@ def prepare():
 
 def norm_command():
     norm = norm_home()
-    descriptor = norm / 'cli/compiler/build/generated/runtime-launchers/launcher.json'
-    settings = json.loads(descriptor.read_text(encoding='utf-8'))
-    java_home = os.environ.get('JAVA_HOME')
-    java = str(Path(java_home) / 'bin' / ('java.exe' if os.name == 'nt' else 'java')) if java_home else 'java'
-    return [java, *settings['jvmArguments'], '--module-path', str(norm / 'cli/compiler/build/install/norm/lib'), '--module', settings['module']]
+    launcher = norm / 'cli/compiler/target/norm-runtime/bin' / ('norm.bat' if os.name == 'nt' else 'norm')
+    if not launcher.is_file():
+        raise RuntimeError(f'Norm launcher not found: {launcher}. Build Norm with its Maven wrapper first.')
+    return [str(launcher)]
 
 
 def gait_command():
