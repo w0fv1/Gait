@@ -4,13 +4,15 @@
 
 ## 获取与构建
 
-Gait 的编译命令是 `norm build gait`，在仓库根目录运行；首次本机编译时 Norm 会准备自己的 Native Image 工具链。需要**兼容本仓库所用接口**的 [Norm](https://github.com/normlanguage/Norm) CLI。当前公开的 Norm `v0.24.0` 尚不兼容；本仓库已用 Norm 源码提交 `6c3e1c5` 构建的 CLI 验证。在兼容的 Norm 安装版发布前，需要先从该源码构建 Norm CLI（Norm 自身使用 Maven），再用它执行以下命令。当前尚未发布 Gait 预编译版本。
+Gait 的编译命令是 `norm build gait`，在仓库根目录运行；首次本机编译时 Norm 会准备自己的 Native Image 工具链。使用已验证的正式版 [Norm v0.26.2](https://github.com/normlanguage/Norm/releases/tag/v0.26.2) CLI。当前尚未发布 Gait 预编译版本。
 
 ```powershell
 norm build gait
 ```
 
-产物位于 `gait/build/gait.exe`（Windows）；其他系统为 `gait/build/gait`。OpenAI 模块由 Norm 包管理器从 [normlanguage/openai](https://github.com/normlanguage/openai/releases/tag/v1) 解析。Norm 发布兼容安装版后，Gait 的构建将只需安装该 CLI 并运行上面的 `norm build`。
+也可用 `norm build --jvm gait` 生成 JVM 应用启动器；运行这种产物需要 Java 25。
+
+产物位于 `gait/build/gait.exe`（Windows）；其他系统为 `gait/build/gait`。OpenAI 模块由 Norm 包管理器从 [normlanguage/openai](https://github.com/normlanguage/openai/releases/tag/v2) 解析。依赖坐标由 [module.norm](gait/module.norm) 统一定义。
 
 ```powershell
 .\gait\build\gait.exe 回复ok

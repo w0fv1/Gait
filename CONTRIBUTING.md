@@ -4,7 +4,7 @@
 
 ## 开发环境
 
-需要 Git、Python 和兼容的 [Norm](https://github.com/normlanguage/Norm) CLI。当前公开的 Norm `v0.24.0` 尚不兼容；已用 Norm 源码提交 `6c3e1c5` 构建的 CLI 验证。在兼容的 Norm 安装版发布前，需按 Norm 自身说明从该源码构建 CLI。在本仓库执行：
+需要 Git、Python 和 [README 指定的 Norm CLI](README.md#获取与构建)。在本仓库执行：
 
 ```powershell
 norm build gait
