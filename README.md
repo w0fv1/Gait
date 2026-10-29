@@ -1,5 +1,7 @@
 # Gait
 
+Built with [Norm](https://github.com/normlanguage/Norm).
+
 使用 Norm 实现的通用 Agent，模型直接回答，并按需调用 Git 工具。
 
 ## 获取与构建
